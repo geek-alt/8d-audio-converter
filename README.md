@@ -2,6 +2,18 @@
 
 A web application to convert audio files into immersive 8D audio experiences.
 
+## Description
+
+The 8D Audio Converter is a modern web-based tool that transforms regular audio files into 8D audio format, creating an immersive listening experience where the sound appears to move around your head in a three-dimensional space. This effect is achieved through advanced audio panning and spatial manipulation techniques using FFmpeg's powerful audio processing capabilities.
+
+### What is 8D Audio?
+
+8D audio is a sound technique that creates the illusion of music moving in a circular pattern around the listener's head, producing an immersive, three-dimensional soundscape. When listened to with headphones, it creates the sensation that the sound is coming from different directions and distances, offering a unique and engaging audio experience.
+
+### How It Works
+
+The application processes audio files by applying dynamic panning effects that move the sound between left and right channels while adjusting phase relationships and spatial cues. The result is an audio file that, when played through headphones, creates the perception of sound sources moving around the listener in three-dimensional space.
+
 ## Features
 
 - **Audio Conversion**: Convert standard audio files to 8D format
