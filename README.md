@@ -69,10 +69,6 @@ The application will be available at `http://localhost:5173` (or the port shown 
 - **Audio Processing**: FFmpeg
 - **Build Tools**: Vite, PostCSS, TypeScript
 
-## License
-
-[Specify your license here]
-
 ## Author
 
-[Your name/handle]
+@geek-alt
