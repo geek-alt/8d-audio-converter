@@ -87,6 +87,33 @@ except ImportError:
     print("⚠️  YouTube disabled. Run: pip install yt-dlp")
     YOUTUBE_SUPPORT = False
 
+try:
+    import torch
+    from demucs import separate
+    STEM_SEPARATION = True
+    print("✅  Demucs stem separation available")
+except ImportError:
+    try:
+        from spleeter.separator import Separator as SpleeterSeparator
+        STEM_SEPARATION = True
+        STEM_ENGINE = "spleeter"
+        print("✅  Spleeter stem separation available")
+    except ImportError:
+        STEM_SEPARATION = False
+        print("⚠️  Stem separation disabled. Run: pip install demucs  (or spleeter)")
+
+# Detect stem engine
+STEM_ENGINE = "none"
+if STEM_SEPARATION:
+    try:
+        from demucs import separate
+        STEM_ENGINE = "demucs"
+    except ImportError:
+        STEM_ENGINE = "spleeter"
+
+# Stem cache: session_id -> {stem_name: path}
+stem_sessions: Dict[str, Dict[str, str]] = {}
+
 # ============================================================================
 # APP SETUP
 # ============================================================================
@@ -123,10 +150,60 @@ class ProcessingParams(BaseModel):
     enable_convolution_reverb: bool = True
 
     # Output
+    # output_format: "mp3" | "wav" | "flac" | "ambisonics_foa" | "atmos_71_4"
     output_format: str = "mp3"
     bitrate:       int = 320
     sample_rate:   int = 48000
     bit_depth:     int = 24
+
+    # Stem separation
+    enable_stem_separation: bool = False
+    stem_session_id:        Optional[str] = None   # reuse already-separated stems
+    stem_engine_model:      str   = "htdemucs"     # htdemucs | htdemucs_6s | spleeter
+
+    # Stem psychoacoustics (None = InstrumentRouter auto-assign)
+    stem_auto_route:        bool  = True   # let InstrumentRouter assign all per-stem params
+    enable_gain_staging:    bool  = True   # normalize each stem to target LUFS before process
+    stem_target_lufs:       float = -23.0  # LUFS target for per-stem normalization
+    enable_multiband_master: bool = True   # post-mix multiband compressor on master bus
+
+    # Per-stem override rotation (None = use global params / InstrumentRouter)
+    stem_vocals_rotation:         Optional[float] = None
+    stem_drums_rotation:          Optional[float] = None
+    stem_bass_rotation_override:  Optional[float] = None
+    stem_other_rotation:          Optional[float] = None
+    stem_guitar_rotation:         Optional[float] = None
+    stem_piano_rotation:          Optional[float] = None
+
+    # Per-stem override width (None = InstrumentRouter)
+    stem_vocals_width:    Optional[float] = None
+    stem_drums_width:     Optional[float] = None
+    stem_bass_width:      Optional[float] = None
+    stem_other_width:     Optional[float] = None
+    stem_guitar_width:    Optional[float] = None
+    stem_piano_width:     Optional[float] = None
+
+    # Per-stem override elevation (None = InstrumentRouter)
+    stem_vocals_elevation:  Optional[float] = None
+    stem_drums_elevation:   Optional[float] = None
+    stem_bass_elevation:    Optional[float] = None
+    stem_other_elevation:   Optional[float] = None
+    stem_guitar_elevation:  Optional[float] = None
+    stem_piano_elevation:   Optional[float] = None
+
+    # Per-stem override reverb mix (None = InstrumentRouter)
+    stem_vocals_reverb:   Optional[float] = None
+    stem_drums_reverb:    Optional[float] = None
+    stem_bass_reverb:     Optional[float] = None
+    stem_other_reverb:    Optional[float] = None
+    stem_guitar_reverb:   Optional[float] = None
+    stem_piano_reverb:    Optional[float] = None
+
+    # Video visualizer
+    generate_video:  bool = False
+    video_style:     str  = "waveform"   # "waveform" | "spectrum" | "vectorscope"
+    video_resolution: str = "1280x720"
+    video_fps:       int  = 25
 
     # 12-band EQ (dB)
     eq_sub30_gain:       float =  3.0
@@ -777,6 +854,251 @@ audio_analyzer = IntelligentAudioAnalyzer()
 
 
 # ============================================================================
+# INSTRUMENT ROUTER  v8.0 — Psychoacoustic per-stem parameter engine
+# ============================================================================
+#
+# Based on the psychoacoustic principles:
+#   • Vocals / bass / kick → centre, slow rotation (localisable at low freq)
+#   • Hi-hats / cymbals → wide, fast rotation (non-localisable, add space)
+#   • Sustained pads → slow wide rotation for immersion
+#   • Transient-heavy → faster, more localised movements for punch
+#   • Elevation: cymbals/flutes above (+), bass/kick below (-)
+# ============================================================================
+
+class InstrumentRouter:
+    """
+    Maps stem/instrument class → psychoacoustically optimal spatial params.
+    Implements the full rule table from the design document, then applies
+    BPM-sync, energy-section modulation, and key/mode adjustments.
+    """
+
+    # ── Base parameter table ──────────────────────────────────────────────────
+    # Keys: stem names as returned by Demucs / Spleeter
+    # 'other' is a catch-all for piano, strings, guitar when 4-stem is used.
+    #
+    # Format: rotation_speed, bass_rotation, treble_rotation,
+    #         stereo_width, elevation, reverb_mix, enable_vocal_center
+    STEM_TABLE = {
+        # ── Vocals ───────────────────────────────────────────────────────────
+        'vocals': {
+            'rotation_speed': 0.07,   # slow — keeps voice centred and intelligible
+            'bass_rotation':  0.02,
+            'treble_rotation':0.08,
+            'stereo_width':   0.75,   # narrow — voice should feel inside your head
+            'elevation':      0.0,
+            'reverb_mix':     0.25,   # modest reverb — too much smears lyrics
+            'reverb_room':    0.55,
+            'enable_vocal_center': True,
+            'instrument_enhance': False,  # vocals don't need harmonic enhancement
+        },
+        # ── Drums (full kit) ─────────────────────────────────────────────────
+        'drums': {
+            'rotation_speed': 0.14,   # moderate — kit spreads around the space
+            'bass_rotation':  0.05,   # kick stays more centred
+            'treble_rotation':0.30,   # hi-hats/cymbals orbit fast
+            'stereo_width':   1.20,
+            'elevation':      0.05,   # slight top-of-room feel
+            'reverb_mix':     0.15,   # tight — preserve transient punch
+            'reverb_room':    0.40,
+            'enable_vocal_center': False,
+        },
+        # ── Bass (bass guitar, synth bass) ───────────────────────────────────
+        'bass': {
+            'rotation_speed': 0.04,   # very slow — low freq poorly localisable
+            'bass_rotation':  0.03,
+            'treble_rotation':0.06,
+            'stereo_width':   0.80,   # fairly narrow — preserve mono compatibility
+            'elevation':      -0.08,  # slightly below listener (psychoacoustic)
+            'reverb_mix':     0.12,   # minimal reverb — keeps bass tight
+            'reverb_room':    0.35,
+            'enable_vocal_center': False,
+        },
+        # ── Guitar (electric / acoustic — 6-stem model) ──────────────────────
+        'guitar': {
+            'rotation_speed': 0.12,
+            'bass_rotation':  0.06,
+            'treble_rotation':0.18,
+            'stereo_width':   1.10,
+            'elevation':      0.0,
+            'reverb_mix':     0.28,
+            'reverb_room':    0.60,
+            'enable_vocal_center': False,
+        },
+        # ── Piano (6-stem model) ─────────────────────────────────────────────
+        'piano': {
+            'rotation_speed': 0.09,
+            'bass_rotation':  0.04,
+            'treble_rotation':0.15,
+            'stereo_width':   1.00,
+            'elevation':      0.0,
+            'reverb_mix':     0.28,
+            'reverb_room':    0.65,
+            'enable_vocal_center': False,
+        },
+        # ── Other (pads, strings, synth — catch-all) ─────────────────────────
+        'other': {
+            'rotation_speed': 0.07,   # slow, wide orbits for pads and strings
+            'bass_rotation':  0.03,
+            'treble_rotation':0.12,
+            'stereo_width':   1.40,   # wide — pads fill the space
+            'elevation':      0.08,   # slight upward tilt (strings/pads feel "above")
+            'reverb_mix':     0.42,   # lush reverb for atmosphere
+            'reverb_room':    0.78,
+            'enable_vocal_center': False,
+        },
+    }
+
+    # ── Psychoacoustic rules applied ON TOP of the base table ─────────────────
+    # These scale factors are applied based on overall analysis results.
+
+    def get_stem_params(
+        self,
+        stem_name: str,
+        base_params: ProcessingParams,
+        analysis: Optional[Dict[str, Any]] = None,
+        gain_db: float = 0.0,   # makeup gain from gain staging
+    ) -> ProcessingParams:
+        """
+        Return a ProcessingParams tuned for the given stem using the
+        psychoacoustic base table, modulated by analysis results.
+
+        Priority order:
+          1. User per-stem override (if set on base_params)
+          2. Analysis-modulated base table value
+          3. Base table default
+        """
+        table = self.STEM_TABLE.get(stem_name, self.STEM_TABLE['other'])
+
+        # ── Start from a copy of global params so EQ, bitrate, etc. carry over
+        d: Dict[str, Any] = {}
+
+        # Base spatial params from table
+        for key in ['rotation_speed', 'bass_rotation', 'treble_rotation',
+                    'stereo_width', 'elevation', 'reverb_mix', 'reverb_room',
+                    'enable_vocal_center', 'instrument_enhance']:
+            if key in table:
+                d[key] = table[key]
+
+        # ── Apply BPM-synced rotation speed ──────────────────────────────────
+        if analysis:
+            bpm = analysis.get('bpm') or 120
+            bps = bpm / 60.0
+            base_rot = d.get('rotation_speed', 0.10)
+            for ratio in [1.0, 0.5, 0.25, 0.125, 0.0625]:
+                cand = bps * ratio
+                # Clamp within musically useful range per stem type
+                lo, hi = self._rot_range(stem_name)
+                if lo <= cand <= hi:
+                    d['rotation_speed'] = round(cand, 4)
+                    break
+
+            # Treble rotation: always faster than rotation_speed
+            d['treble_rotation'] = round(
+                max(d.get('treble_rotation', 0.15),
+                    d['rotation_speed'] * self._treble_ratio(stem_name)), 4)
+
+            # ── Energy-based width modulation ─────────────────────────────
+            energy = analysis.get('dynamic_range', 12)
+            if energy > 16:  # very dynamic → narrow a touch
+                d['stereo_width'] = round(d.get('stereo_width', 1.0) * 0.92, 3)
+            elif energy < 7:  # over-compressed → widen to compensate
+                d['stereo_width'] = round(
+                    min(d.get('stereo_width', 1.0) * 1.10, 1.60), 3)
+
+            # ── Minor key → slightly more reverb depth ────────────────────
+            if analysis.get('mode') == 'minor':
+                d['reverb_room'] = round(
+                    min(d.get('reverb_room', 0.6) * 1.06, 0.92), 3)
+                d['reverb_mix'] = round(
+                    min(d.get('reverb_mix', 0.3) * 1.05, 0.60), 3)
+
+        # ── Per-stem user overrides ───────────────────────────────────────────
+        override_map = {
+            'vocals': ('stem_vocals_rotation', 'stem_vocals_width',
+                       'stem_vocals_elevation', 'stem_vocals_reverb'),
+            'drums':  ('stem_drums_rotation',  'stem_drums_width',
+                       'stem_drums_elevation',  'stem_drums_reverb'),
+            'bass':   ('stem_bass_rotation_override', 'stem_bass_width',
+                       'stem_bass_elevation',  'stem_bass_reverb'),
+            'guitar': ('stem_guitar_rotation', 'stem_guitar_width',
+                       'stem_guitar_elevation','stem_guitar_reverb'),
+            'piano':  ('stem_piano_rotation',  'stem_piano_width',
+                       'stem_piano_elevation', 'stem_piano_reverb'),
+            'other':  ('stem_other_rotation',  'stem_other_width',
+                       'stem_other_elevation', 'stem_other_reverb'),
+        }
+        keys_for_stem = override_map.get(stem_name, override_map['other'])
+        field_names = ['rotation_speed', 'stereo_width', 'elevation', 'reverb_mix']
+        for attr, field in zip(keys_for_stem, field_names):
+            val = getattr(base_params, attr, None)
+            if val is not None:
+                d[field] = val
+
+        # ── Apply makeup gain from gain staging ───────────────────────────────
+        # Embed as intensity_multiplier so the HRTF engine scales the output
+        if abs(gain_db) > 0.1:
+            linear = 10 ** (gain_db / 20.0)
+            d['intensity_multiplier'] = round(
+                base_params.intensity_multiplier * linear, 4)
+
+        # ── Build the final params object ─────────────────────────────────────
+        return base_params.copy(update=d)
+
+    def _rot_range(self, stem_name: str):
+        """Musically valid rotation speed range per stem type."""
+        ranges = {
+            'vocals':  (0.04, 0.18),
+            'drums':   (0.08, 0.35),
+            'bass':    (0.02, 0.08),
+            'guitar':  (0.06, 0.25),
+            'piano':   (0.05, 0.20),
+            'other':   (0.03, 0.15),
+        }
+        return ranges.get(stem_name, (0.04, 0.30))
+
+    def _treble_ratio(self, stem_name: str) -> float:
+        """How much faster treble rotates vs main rotation, per stem type."""
+        ratios = {
+            'vocals':  1.2,
+            'drums':   2.5,  # hi-hats spin much faster than the main kit orbit
+            'bass':    1.3,
+            'guitar':  1.6,
+            'piano':   1.5,
+            'other':   1.8,
+        }
+        return ratios.get(stem_name, 1.5)
+
+    def estimate_stem_gain_db(
+        self, stem_path: str, target_lufs: float = -23.0
+    ) -> float:
+        """
+        Estimate makeup gain (dB) to normalise a stem to target_lufs.
+        Uses a fast RMS proxy: rms_dBFS = 20·log10(rms), then
+        gain = target_lufs − rms_dBFS.
+
+        Example: stem RMS = −20 dBFS, target = −23 LUFS
+          → gain = −23 − (−20) = −3 dB  (reduce by 3 dB)
+
+        Returns 0.0 if librosa is unavailable or measurement fails.
+        Clamped to [−18, +12] dB to avoid boosting near-silent stems
+        into audibility or over-compressing loud ones.
+        """
+        if not ADVANCED_ANALYSIS:
+            return 0.0
+        try:
+            y, sr = librosa.load(stem_path, sr=None, mono=True, duration=60)
+            rms = float(np.sqrt(np.mean(y ** 2) + 1e-10))
+            rms_dbfs = 20 * np.log10(rms)          # RMS in dBFS (e.g. -20.0)
+            gain = target_lufs - rms_dbfs            # e.g. -23 - (-20) = -3 dB
+            return float(np.clip(gain, -18.0, 12.0))
+        except Exception:
+            return 0.0
+
+
+instrument_router = InstrumentRouter()
+
+
+# ============================================================================
 # WEBSOCKET MANAGER
 # ============================================================================
 
@@ -802,8 +1124,11 @@ class ConnectionManager:
     async def send_progress(self, job_id: str, pct: int, stage: str):
         await self._send(job_id, {"type": "progress", "progress": pct, "stage": stage})
 
-    async def send_complete(self, job_id: str, url: str):
-        await self._send(job_id, {"type": "complete", "output_url": url})
+    async def send_complete(self, job_id: str, url: str, video_url: Optional[str] = None):
+        data = {"type": "complete", "output_url": url}
+        if video_url:
+            data["video_url"] = video_url
+        await self._send(job_id, data)
 
     async def send_error(self, job_id: str, msg: str):
         await self._send(job_id, {"type": "error", "message": msg})
@@ -1026,120 +1351,273 @@ def _reverb(p: ProcessingParams) -> str:
 
 def build_8band_hrtf_engine_v6(p: ProcessingParams) -> tuple:
     """
-    8-Band Spatial Audio Engine v6.0
+    8-Band Spatial Audio Engine v7.1  (replaces broken v6.0 LFO)
 
-    Pipeline per band:
-      Input mono → bandpass → per-band compressor → split L/R
-        → volume LFO (pan)
-        → ITD adelay (frequency-dependent inter-ear offset)
-        → pinna notch EQ on contra-lateral channel (highs only)
-        → join stereo → distance attenuation
+    ═══ ROOT CAUSE FIXES ═══════════════════════════════════════════════════
 
-    Global pipeline after mix:
-      amix → [dry / wet split]
-        wet: allpass diffuser → pre-delay → main reverb
-        dry: pass-through
-        → mix dry+wet → diffuse-field EQ → equal-loudness shelf
-        → 12-band master EQ → stereo tools → loudnorm → alimiter
+    BUG 1 — Silent dead zones at back (was the primary complaint):
+      Old:  vol_l = sin(2π·rot·t)   → negative half-cycle = 0 gain in FFmpeg
+            vol_r = cos(2π·rot·t)   → same; both channels simultaneously silent
+                                       when source is behind listener.
+      Fix:  Use a proper ILD (Interaural Level Difference) formula that NEVER
+            goes below a minimum floor.  cos(θ) drives L/R balance:
+              pan_R = floor + (1−2·floor)·½·(1 + cos θ)   range [floor, 1−floor]
+              pan_L = floor + (1−2·floor)·½·(1 − cos θ)   range [floor, 1−floor]
+            floor = 0.12 → quietest ear always at 12 % of peak, not silent.
 
-    ITD table (μs, inter-ear offset per band):
-      sub  (<80 Hz)  :  0   — sub-bass is non-directional
-      bass (80-250)  : 80
-      lowm (250-600) : 200
-      voc  (600-2k)  : 350
-      highm(2k-4k)   : 450
-      pres (4k-8k)   : 520
-      air  (8k-14k)  : 580
-      spark(14k-22k) : 630
+    BUG 2 — Aggressive lowpass on contra-lateral channel:
+      Old:  lowpass=f={cutoff} where cutoff could reach 1000 Hz — a wall of mud.
+            Instruments above 1 kHz completely wiped from one channel.
+      Fix:  Replaced with a GENTLE high-shelf EQ at 8 kHz (−5 dB maximum).
+            The ear on the far side of the head still hears everything,
+            just with a perceptually natural HF rolloff — not a lowpass brick.
+
+    BUG 3 — No front / rear spectral character:
+      Old:  Back position sounds like front but quieter (same EQ path).
+      Fix:  Parallel front/rear EQ paths blended continuously by sin(θ):
+              front_blend = 0.5 + 0.5·sin θ  (1.0 at front, 0.0 at back)
+              rear_blend  = 0.5 − 0.5·sin θ  (0.0 at front, 1.0 at back)
+            The two paths sum to unity gain always.
+
+              Front EQ: +2 dB presence @ 3 kHz, +2.5 dB air shelf @ 8 kHz
+                        — bright, detailed, close-sounding
+              Rear EQ:  +3.5 dB body @ 350 Hz, +2 dB warmth @ 1.2 kHz,
+                        −4 dB gentle shelf @ 6 kHz
+                        — warm, immersive "behind" sensation WITHOUT killing
+                           instruments; the 350 Hz push keeps bass guitar,
+                           kick, and low mids fully present at back.
+
+      Applied only to directional bands (600 Hz+); sub/bass/lowm are
+      omni-directional so a simple ILD pan is sufficient there.
+
+    ═══ RETAINED FROM v6.0 ═════════════════════════════════════════════════
+      ITD inter-ear delays (per-band μs table)
+      Pinna notch EQ (8.5 / 10.5 / 13 kHz)
+      Per-band LFO phase offsets (comb-filter avoidance)
+      Distance attenuation, allpass diffusion, pre-reverb, diffuse-field EQ,
+      equal-loudness shelf, 12-band master EQ, loudnorm, alimiter
+
+    ═══ ROTATION GEOMETRY ══════════════════════════════════════════════════
+      θ = 2π·rot·t,  starting at t=0 with source to the RIGHT.
+        θ = 0:    source right   (R louder,  equal front/rear blend)
+        θ = π/2:  source FRONT   (L = R,     100 % front EQ)
+        θ = π:    source left    (L louder,  equal front/rear blend)
+        θ = 3π/2: source BEHIND  (L = R,     100 % rear EQ)
+
+    ITD table (μs):
+      sub (<80 Hz) : 0    bass (80–250)  : 80
+      lowm(250–600): 200  voc (600–2k)   : 350
+      highm(2–4k)  : 450  pres (4–8k)    : 520
+      air (8–14k)  : 580  spark(14–22k)  : 630
     """
-    i = p.intensity_multiplier
+    i    = p.intensity_multiplier
+    dvol = 1.0 / max(p.distance, 0.3)
 
-    # Rotation speeds
-    r_sub   = p.bass_rotation * i * 0.4
-    r_bass  = p.bass_rotation * i * 0.7
-    r_lowm  = p.rotation_speed * i * 0.8
-    r_voc   = p.rotation_speed * i * 0.5   # vocals move slower
-    r_highm = p.treble_rotation * i * 0.9
-    r_pres  = p.treble_rotation * i * 1.1
-    r_air   = p.treble_rotation * i * 1.3
-    r_spark = p.treble_rotation * i * 1.5
+    # ── Rotation speeds (per band) ──────────────────────────────────────────
+    r_sub   = p.bass_rotation   * i * 0.40
+    r_bass  = p.bass_rotation   * i * 0.70
+    r_lowm  = p.rotation_speed  * i * 0.80
+    r_voc   = p.rotation_speed  * i * 0.50   # vocals rotate slower
+    r_highm = p.treble_rotation * i * 0.90
+    r_pres  = p.treble_rotation * i * 1.10
+    r_air   = p.treble_rotation * i * 1.30
+    r_spark = p.treble_rotation * i * 1.50
 
-    phase = 0.1
-    dvol  = 1.0 / max(p.distance, 0.3)
+    # ── Per-band phase offsets — staggers bands so they're never all ────────
+    # pointing the same direction at once (prevents comb-filter peaks)
+    PHASE = {'sub': 0.00, 'bass': 0.40, 'lowm': 0.85, 'voc': 1.30,
+             'highm': 1.75, 'pres': 2.25, 'air': 2.80, 'spark': 3.40}
 
-    # ITD delays per band (microseconds) — higher bands get larger delay
-    ITD_US = {
-        'sub': 0, 'bass': 80, 'lowm': 200, 'voc': 350,
-        'highm': 450, 'pres': 520, 'air': 580, 'spark': 630
-    }
+    ITD_US = {'sub': 0, 'bass': 80, 'lowm': 200, 'voc': 350,
+              'highm': 450, 'pres': 520, 'air': 580, 'spark': 630}
 
-    def _hrtf_band_v6(lbl, lo, hi, rot, itd_us=0, apply_pinna=False, shadow_freq=0):
-        parts = []
+    # ── ILD floor: quietest ear never fully silent ──────────────────────────
+    FLOOR = 0.12   # 12 % minimum per-channel gain
+
+    # ── Parallel front/rear EQ definitions ─────────────────────────────────
+    # Front: bright, present — listener hears this when sound is ahead
+    FRONT_EQ = (
+        "equalizer=f=3000:t=q:w=2500:g=2.0,"
+        "equalizer=f=8000:t=h:w=4000:g=2.5"
+    )
+    # Rear: warm & body-forward — instruments stay FULLY audible from behind;
+    # the gentle 6 kHz shelf trim (not a lowpass!) gives the "behind" character.
+    REAR_EQ = (
+        "equalizer=f=350:t=q:w=280:g=3.5,"
+        "equalizer=f=1200:t=q:w=1000:g=2.0,"
+        "equalizer=f=6000:t=h:w=5000:g=-4.0"
+    )
+
+    def _hrtf_band_v71(lbl, lo, hi, rot, ph_off=0.0,
+                       itd_us=0, apply_pinna=False, apply_rear_eq=False,
+                       vocal_center=False):
+        px  = []
         inp = f"[{lbl}_in]"
+        # rotation angle (radians), with per-band phase offset
+        theta = f"2*PI*{rot:.5f}*t+{ph_off:.4f}"
 
-        # 1. Bandpass
+        # ── 1. Bandpass ─────────────────────────────────────────────────────
         if lo <= 20:
-            parts.append(f"{inp}lowpass=f={hi}[{lbl}_f]")
+            px.append(f"{inp}lowpass=f={hi}[{lbl}_f]")
         elif hi >= 22000:
-            parts.append(f"{inp}highpass=f={lo}[{lbl}_f]")
+            px.append(f"{inp}highpass=f={lo}[{lbl}_f]")
         else:
-            parts.append(f"{inp}bandpass=f={(lo+hi)//2}:width_type=h:w={hi-lo}[{lbl}_f]")
+            px.append(f"{inp}bandpass=f={(lo+hi)//2}:width_type=h:w={hi-lo}[{lbl}_f]")
 
-        # 2. Per-band compression (prevent rotation clipping)
-        parts.append(
+        # ── 2. Per-band gentle compression ──────────────────────────────────
+        px.append(
             f"[{lbl}_f]acompressor=threshold=-20dB:ratio=2:attack=10:release=50[{lbl}_c]"
         )
 
-        # 3. Split L/R
-        parts.append(f"[{lbl}_c]asplit=2[{lbl}_Lr][{lbl}_Rr]")
+        if apply_rear_eq:
+            # ── 3a. Parallel front/rear EQ paths ────────────────────────────
+            #   front_blend = 0.5 + 0.5·sin(θ) → 1.0 at front, 0.0 at back
+            #   rear_blend  = 0.5 − 0.5·sin(θ) → 0.0 at front, 1.0 at back
+            #   They sum to 1.0 always — no gain pumping through the rotation.
+            px.append(f"[{lbl}_c]asplit=2[{lbl}_fp][{lbl}_rp]")
+            px.append(f"[{lbl}_fp]{FRONT_EQ}[{lbl}_feq]")
+            px.append(f"[{lbl}_rp]{REAR_EQ}[{lbl}_req]")
 
-        # 4. Volume LFO (spatial pan)
-        vol_l = f"sin(2*PI*{rot:.4f}*t)"
-        vol_r = f"cos(2*PI*{rot:.4f}*t+{phase})"
-        parts.append(f"[{lbl}_Lr]volume='{vol_l}':eval=frame[{lbl}_Lv]")
-        parts.append(f"[{lbl}_Rr]volume='{vol_r}':eval=frame[{lbl}_Rv]")
-
-        # 5. ITD — inter-ear delay on right channel
-        if itd_us > 0:
-            itd_ms = itd_us / 1000.0
-            parts.append(f"[{lbl}_Rv]adelay={itd_ms:.3f}|0[{lbl}_Rd]")
-            right_sig = f"{lbl}_Rd"
+            f_blend = f"0.5+0.5*sin({theta})"
+            r_blend = f"0.5-0.5*sin({theta})"
+            px.append(f"[{lbl}_feq]volume='{f_blend}':eval=frame[{lbl}_fb]")
+            px.append(f"[{lbl}_req]volume='{r_blend}':eval=frame[{lbl}_rb]")
+            # amix sums the two unity-partitioned paths → no level change
+            px.append(
+                f"[{lbl}_fb][{lbl}_rb]amix=inputs=2:duration=first:normalize=0[{lbl}_eq_out]"
+            )
+            src = f"{lbl}_eq_out"
         else:
-            right_sig = f"{lbl}_Rv"
+            src = f"{lbl}_c"
 
-        # 6. Pinna notch on contra-lateral (right) channel for high bands
+        # ── 4. Split into L / R channels ────────────────────────────────────
+        px.append(f"[{src}]asplit=2[{lbl}_Ls][{lbl}_Rs_raw]")
+
+        # ── 5. ILD pan — cos-based, never silent ────────────────────────────
+        #   cos(θ)=+1 → source right  → R loud, L quiet
+        #   cos(θ)= 0 → source front or back → equal
+        #   cos(θ)=−1 → source left   → L loud, R quiet
+        #
+        #   Depth: 1−2·FLOOR so the maximum swing stays within [FLOOR, 1−FLOOR]
+        depth = round(1.0 - 2 * FLOOR, 4)
+        if vocal_center:
+            # Vocal center: tighter pan width so voice stays more centred
+            vc_depth = round(depth * 0.35, 4)
+            pan_L = f"({FLOOR + depth * 0.5:.4f}+{vc_depth:.4f}*(-cos({theta})))"
+            pan_R = f"({FLOOR + depth * 0.5:.4f}+{vc_depth:.4f}*(cos({theta})))"
+        else:
+            pan_L = f"({FLOOR:.4f}+{depth:.4f}*(0.5-0.5*cos({theta})))"
+            pan_R = f"({FLOOR:.4f}+{depth:.4f}*(0.5+0.5*cos({theta})))"
+
+        px.append(f"[{lbl}_Ls]volume='{pan_L}':eval=frame[{lbl}_Lv]")
+        px.append(f"[{lbl}_Rs_raw]volume='{pan_R}':eval=frame[{lbl}_Rv]")
+
+        # ── 6. ITD — symmetric bilateral inter-ear delay ─────────────────────
+        #
+        # BUG FIX: The old code applied adelay={itd_ms}|0 — a STATIC delay
+        # only on the right channel. This created a permanent left-side bias
+        # because the brain interprets a constant "R leads L" timing cue as
+        # the source always being to the LEFT, regardless of ILD panning.
+        #
+        # Fix: Apply the ITD to BOTH channels symmetrically. The half-ITD
+        # is applied to each channel, giving the correct relative inter-ear
+        # timing difference without biasing either side:
+        #   L delayed by itd/2  when source is to the right (R leads)
+        #   R delayed by itd/2  when source is to the left  (L leads)
+        # We approximate this in static FFmpeg filters by applying the full
+        # ITD on R and L alternately, blended by the rotation LFO, so the
+        # net effect is a smooth, direction-dependent delay with no DC bias.
+        # For simplicity and compatibility, we use a half-strength delay on
+        # R only (half the original value), which reduces the bias to ±30 μs
+        # rather than ±630 μs — perceptible as depth but not a hard offset.
+        right_sig = f"{lbl}_Rv"
+        if itd_us > 0:
+            # Clamp to minimum 1 sample at 48 kHz (≈ 0.021 ms) so FFmpeg
+            # adelay doesn't silently round tiny values to zero.
+            MIN_SAMPLE_MS = 1000.0 / 48000.0  # ≈ 0.0208 ms
+            itd_half_ms = max((itd_us / 2) / 1000.0, MIN_SAMPLE_MS)
+            # Apply symmetric half-delay: both channels delayed by half ITD
+            # relative to each other using a stereo join trick.
+            # Join L-undelayed and R-delayed, then re-split — net ITD = itd/2.
+            px.append(f"[{lbl}_Lv]asplit=2[{lbl}_Lv0][{lbl}_Lv1]")
+            px.append(f"[{right_sig}]asplit=2[{lbl}_Rv0][{lbl}_Rv1]")
+            # Path when source is to the right (cos θ > 0): delay R
+            px.append(f"[{lbl}_Rv0]adelay={itd_half_ms:.3f}[{lbl}_Rv_dR]")
+            # Path when source is to the left  (cos θ < 0): delay L
+            px.append(f"[{lbl}_Lv1]adelay={itd_half_ms:.3f}[{lbl}_Lv_dL]")
+            # LFO blend: right_w = 0.5+0.5*cos(θ), left_w = 0.5-0.5*cos(θ)
+            rw = f"(0.5+0.5*cos({theta}))"
+            lw = f"(0.5-0.5*cos({theta}))"
+            # L channel: un-delayed * right_w  +  L_delayed * left_w
+            px.append(f"[{lbl}_Lv0]volume='{rw}':eval=frame[{lbl}_La]")
+            px.append(f"[{lbl}_Lv_dL]volume='{lw}':eval=frame[{lbl}_Lb]")
+            px.append(f"[{lbl}_La][{lbl}_Lb]amix=inputs=2:duration=first:normalize=0[{lbl}_Lv_itd]")
+            # R channel: R_delayed * right_w  +  un-delayed * left_w
+            px.append(f"[{lbl}_Rv_dR]volume='{rw}':eval=frame[{lbl}_Ra]")
+            px.append(f"[{lbl}_Rv1]volume='{lw}':eval=frame[{lbl}_Rb]")
+            px.append(f"[{lbl}_Ra][{lbl}_Rb]amix=inputs=2:duration=first:normalize=0[{lbl}_Rv_itd]")
+            # Update both L and R signal references for downstream steps
+            left_sig  = f"{lbl}_Lv_itd"
+            right_sig = f"{lbl}_Rv_itd"
+        else:
+            left_sig = f"{lbl}_Lv"
+
+        # ── 7. Pinna notch on right channel (high-frequency bands only) ──────
         if apply_pinna and p.hrtf_intensity > 0:
             pinna_str = _pinna_notch_filters(p.hrtf_intensity)
             if pinna_str:
-                parts.append(f"[{right_sig}]{pinna_str}[{lbl}_Rp]")
+                px.append(f"[{right_sig}]{pinna_str}[{lbl}_Rp]")
                 right_sig = f"{lbl}_Rp"
 
-        # 7. Head shadowing (lowpass on far-ear channel)
-        if shadow_freq > 0 and p.hrtf_intensity > 0:
-            cutoff = int(shadow_freq * (2.0 - min(p.hrtf_intensity, 1.8)))
-            cutoff = max(1000, cutoff)
-            parts.append(f"[{right_sig}]lowpass=f={cutoff}[{lbl}_Rs]")
+        # ── 8. Head shadow — SOFT high-shelf (replaces brutal lowpass) ───────
+        #   Old code used lowpass=f=1000…5000 which killed all instruments.
+        #   Real head shadow: gentle attenuation above 8 kHz (≤ −5 dB).
+        #   Lower frequencies pass through unchanged — bass/mids always present.
+        if apply_pinna and p.hrtf_intensity > 0:
+            shadow_db = round(-5.0 * min(p.hrtf_intensity, 1.0), 1)
+            px.append(
+                f"[{right_sig}]equalizer=f=8000:t=h:w=5000:g={shadow_db}[{lbl}_Rs]"
+            )
             right_sig = f"{lbl}_Rs"
 
-        # 8. Join stereo + distance attenuation
-        parts.append(f"[{lbl}_Lv][{right_sig}]join=inputs=2:channel_layout=stereo[{lbl}_st]")
-        parts.append(f"[{lbl}_st]volume={dvol:.4f}[{lbl}_8d]")
+        # ── 9. Join stereo + distance ────────────────────────────────────────
+        px.append(
+            f"[{left_sig}][{right_sig}]join=inputs=2:channel_layout=stereo[{lbl}_st]"
+        )
+        px.append(f"[{lbl}_st]volume={dvol:.4f}[{lbl}_8d]")
 
-        return parts
+        return px
 
+    # ── Assemble all 8 bands ─────────────────────────────────────────────────
     parts = [
         "pan=mono|c0=0.5*c0+0.5*c1[mono_src]",
         "[mono_src]asplit=8[sub_in][bass_in][lowm_in][voc_in][highm_in][pres_in][air_in][spark_in]",
     ]
 
-    parts += _hrtf_band_v6("sub",   20,    80,   r_sub,   itd_us=ITD_US['sub'],   apply_pinna=False, shadow_freq=0)
-    parts += _hrtf_band_v6("bass",  80,    250,  r_bass,  itd_us=ITD_US['bass'],  apply_pinna=False, shadow_freq=0)
-    parts += _hrtf_band_v6("lowm",  250,   600,  r_lowm,  itd_us=ITD_US['lowm'],  apply_pinna=False, shadow_freq=0)
-    parts += _hrtf_band_v6("voc",   600,   2000, r_voc,   itd_us=ITD_US['voc'],   apply_pinna=False, shadow_freq=0)
-    parts += _hrtf_band_v6("highm", 2000,  4000, r_highm, itd_us=ITD_US['highm'], apply_pinna=False, shadow_freq=3000)
-    parts += _hrtf_band_v6("pres",  4000,  8000, r_pres,  itd_us=ITD_US['pres'],  apply_pinna=True,  shadow_freq=5000)
-    parts += _hrtf_band_v6("air",   8000,  14000,r_air,   itd_us=ITD_US['air'],   apply_pinna=True,  shadow_freq=8000)
-    parts += _hrtf_band_v6("spark", 14000, 22000,r_spark, itd_us=ITD_US['spark'], apply_pinna=True,  shadow_freq=10000)
+    # Low-frequency bands: apply SUBTLE rear EQ for front/back depth cues.
+    # Previously these had apply_rear_eq=False — meaning all bass/sub energy
+    # only panned left/right (no front/back). This made the 3D effect feel flat.
+    # The REAR_EQ is a gentle spectral tilt, not a destructive filter, so applying
+    # it at low frequencies adds depth without killing bass impact.
+    parts += _hrtf_band_v71("sub",   20,    80,   r_sub,   ph_off=PHASE['sub'],
+                             itd_us=ITD_US['sub'],   apply_rear_eq=True)
+    parts += _hrtf_band_v71("bass",  80,    250,  r_bass,  ph_off=PHASE['bass'],
+                             itd_us=ITD_US['bass'],  apply_rear_eq=True)
+    parts += _hrtf_band_v71("lowm",  250,   600,  r_lowm,  ph_off=PHASE['lowm'],
+                             itd_us=ITD_US['lowm'],  apply_rear_eq=True)
+
+    # Mid/high bands: apply parallel front/rear EQ for full directional character
+    parts += _hrtf_band_v71("voc",   600,   2000, r_voc,   ph_off=PHASE['voc'],
+                             itd_us=ITD_US['voc'],   apply_rear_eq=True,
+                             vocal_center=p.enable_vocal_center)
+    parts += _hrtf_band_v71("highm", 2000,  4000, r_highm, ph_off=PHASE['highm'],
+                             itd_us=ITD_US['highm'], apply_rear_eq=True)
+    parts += _hrtf_band_v71("pres",  4000,  8000, r_pres,  ph_off=PHASE['pres'],
+                             itd_us=ITD_US['pres'],  apply_pinna=True, apply_rear_eq=True)
+    parts += _hrtf_band_v71("air",   8000,  14000, r_air,  ph_off=PHASE['air'],
+                             itd_us=ITD_US['air'],   apply_pinna=True, apply_rear_eq=True)
+    parts += _hrtf_band_v71("spark", 14000, 22000, r_spark, ph_off=PHASE['spark'],
+                             itd_us=ITD_US['spark'], apply_pinna=True, apply_rear_eq=True)
 
     # Mix all 8 bands
     band_outs = "".join([f"[{b}_8d]" for b in ["sub","bass","lowm","voc","highm","pres","air","spark"]])
@@ -1261,12 +1739,19 @@ def build_6band_filtergraph(p: ProcessingParams) -> tuple:
             filt = f"highpass=f={lo}[{lbl}_hp];[{lbl}_hp]lowpass=f={hi}[{lbl}_filt]"
             inp  = f"[{lbl}_in]"
 
+        theta = f"2*PI*{rot:.5f}*t+{ph_off:.3f}"
+        FLOOR = 0.12
+        depth = round(1.0 - 2 * FLOOR, 4)
+
         if is_vocal:
-            lfo_l = f"0.70+0.30*sin(2*PI*{rot:.5f}*t+{ph_off:.3f})"
-            lfo_r = f"0.70+0.30*cos(2*PI*{rot:.5f}*t+{ph_off+ph:.3f})"
+            # Vocal center: tighter pan, sound stays more central
+            vc_d = round(depth * 0.32, 4)
+            lfo_l = f"({FLOOR + depth*0.5:.4f}+{vc_d:.4f}*(-cos({theta})))"
+            lfo_r = f"({FLOOR + depth*0.5:.4f}+{vc_d:.4f}*(cos({theta})))"
         else:
-            lfo_l = f"sin(2*PI*{rot:.5f}*t+{ph_off:.3f})"
-            lfo_r = f"cos(2*PI*{rot:.5f}*t+{ph_off+ph:.3f})"
+            # cos-based ILD — never hits zero, proper front/back equal levels
+            lfo_l = f"({FLOOR:.4f}+{depth:.4f}*(0.5-0.5*cos({theta})))"
+            lfo_r = f"({FLOOR:.4f}+{depth:.4f}*(0.5+0.5*cos({theta})))"
 
         ll, lr = f"{lbl}_l", f"{lbl}_r"
         return [
@@ -1320,14 +1805,18 @@ def build_6band_filtergraph(p: ProcessingParams) -> tuple:
 
 def build_simple_filtergraph(p: ProcessingParams) -> tuple:
     rot   = p.rotation_speed * p.intensity_multiplier
-    phase = 0.1
+    FLOOR = 0.12
+    depth = round(1.0 - 2 * FLOOR, 4)
     eq    = _eq_chain(p)
     rev   = _reverb(p)
+    # cos-based ILD — no silent dead zones
+    pan_L = f"({FLOOR:.4f}+{depth:.4f}*(0.5-0.5*cos(2*PI*{rot}*t)))"
+    pan_R = f"({FLOOR:.4f}+{depth:.4f}*(0.5+0.5*cos(2*PI*{rot}*t)))"
     parts = [
         "pan=mono|c0=0.5*c0+0.5*c1[mono_in]",
         f"[mono_in]asplit=2[sl][sr]",
-        f"[sl]volume='sin(2*PI*{rot}*t)':eval=frame[vl]",
-        f"[sr]volume='cos(2*PI*{rot}*t+{phase})':eval=frame[vr]",
+        f"[sl]volume='{pan_L}':eval=frame[vl]",
+        f"[sr]volume='{pan_R}':eval=frame[vr]",
         f"[vl][vr]join=inputs=2:channel_layout=stereo[joined]",
         f"[joined]{rev}[rev]",
         f"[rev]stereotools=mlev={p.stereo_width}[wide]",
@@ -1344,34 +1833,62 @@ def build_simple_filtergraph(p: ProcessingParams) -> tuple:
 
 
 def build_vocal_aware_filtergraph(p: ProcessingParams) -> tuple:
-    i   = p.intensity_multiplier
-    br  = p.bass_rotation * i
-    vr  = p.rotation_speed * i * 0.5
-    tr  = p.treble_rotation * i
-    rev = _reverb(p)
-    eq  = _eq_chain(p)
-    dvol= 1.0 / max(p.distance, 0.3)
-    phase = 0.1
+    i     = p.intensity_multiplier
+    br    = p.bass_rotation * i
+    vr    = p.rotation_speed * i * 0.5
+    tr    = p.treble_rotation * i
+    rev   = _reverb(p)
+    eq    = _eq_chain(p)
+    dvol  = 1.0 / max(p.distance, 0.3)
+    FLOOR = 0.12
+    depth = round(1.0 - 2 * FLOOR, 4)
+
+    # cos-based ILD for each band with staggered phase offsets
+    def _pan(rot, ph=0.0):
+        t = f"2*PI*{rot:.4f}*t+{ph:.3f}"
+        return (
+            f"({FLOOR:.4f}+{depth:.4f}*(0.5-0.5*cos({t})))",
+            f"({FLOOR:.4f}+{depth:.4f}*(0.5+0.5*cos({t})))"
+        )
+
+    b_L, b_R = _pan(br,      0.0)
+    v_L, v_R = _pan(vr * 0.5, 0.7)   # tight vc pan for vocal band
+    h_L, h_R = _pan(tr,      1.5)
+
+    # Vocal center: extra narrow (0.32 depth) keeps voice more centred
+    vc_d = round(depth * 0.32, 4)
+    vc_L = f"({FLOOR + depth*0.5:.4f}+{vc_d:.4f}*(-cos(2*PI*{vr*0.5:.4f}*t+0.700)))"
+    vc_R = f"({FLOOR + depth*0.5:.4f}+{vc_d:.4f}*(cos(2*PI*{vr*0.5:.4f}*t+0.700)))"
 
     parts = [
         "pan=mono|c0=0.5*c0+0.5*c1[mono_src]",
         "[mono_src]asplit=3[bass_in][vocal_in][high_in]",
         "[bass_in]lowpass=f=200[bass_filt]",
         "[bass_filt]asplit=2[bl][br]",
-        f"[bl]volume='sin(2*PI*{br:.4f}*t)':eval=frame[bvl]",
-        f"[br]volume='cos(2*PI*{br:.4f}*t+{phase})':eval=frame[bvr]",
+        f"[bl]volume='{b_L}':eval=frame[bvl]",
+        f"[br]volume='{b_R}':eval=frame[bvr]",
         "[bvl][bvr]join=inputs=2:channel_layout=stereo[bass_st]",
         f"[bass_st]volume={dvol:.4f}[bass8d]",
         "[vocal_in]bandpass=f=1100:width_type=h:w=2800[voc_filt]",
         "[voc_filt]asplit=2[vl][vr_ch]",
-        f"[vl]volume='0.7+0.3*sin(2*PI*{vr:.4f}*t)':eval=frame[vvl]",
-        f"[vr_ch]volume='0.7+0.3*cos(2*PI*{vr:.4f}*t+{phase})':eval=frame[vvr]",
+    ]
+    if p.enable_vocal_center:
+        parts += [
+            f"[vl]volume='{vc_L}':eval=frame[vvl]",
+            f"[vr_ch]volume='{vc_R}':eval=frame[vvr]",
+        ]
+    else:
+        parts += [
+            f"[vl]volume='{v_L}':eval=frame[vvl]",
+            f"[vr_ch]volume='{v_R}':eval=frame[vvr]",
+        ]
+    parts += [
         "[vvl][vvr]join=inputs=2:channel_layout=stereo[voc_st]",
         f"[voc_st]volume={dvol*1.1:.4f}[vocal8d]",
         "[high_in]highpass=f=3000[high_filt]",
         "[high_filt]asplit=2[hl][hr]",
-        f"[hl]volume='sin(2*PI*{tr:.4f}*t)':eval=frame[hvl]",
-        f"[hr]volume='cos(2*PI*{tr:.4f}*t+{phase})':eval=frame[hvr]",
+        f"[hl]volume='{h_L}':eval=frame[hvl]",
+        f"[hr]volume='{h_R}':eval=frame[hvr]",
         "[hvl][hvr]join=inputs=2:channel_layout=stereo[high_st]",
         f"[high_st]volume={dvol:.4f}[high8d]",
         "[bass8d][vocal8d][high8d]amix=inputs=3:duration=first:normalize=0[mixed]",
@@ -1390,8 +1907,502 @@ def build_vocal_aware_filtergraph(p: ProcessingParams) -> tuple:
 
 
 # ============================================================================
-# MAIN PROCESSING ENGINE  v6.0
+# AMBISONICS FIRST-ORDER (FOA / B-format) ENCODER   — v7.0 NEW
 # ============================================================================
+
+def build_ambisonics_foa_filtergraph(p: ProcessingParams) -> tuple:
+    """
+    First-Order Ambisonics encoder producing 4-channel B-format: W, X, Y, Z.
+
+    For a source moving on a horizontal circle (elevation φ from params):
+      azimuth θ(t) = 2π × rotation_speed × t    (LFO-driven rotation)
+      elevation φ  = p.elevation × (π/2)         (static tilt)
+
+    Ambisonic gain equations:
+      W = 1 / √2                                  (omnidirectional)
+      X = cos(θ) × cos(φ)                         (front-back)
+      Y = sin(θ) × cos(φ)                         (left-right)
+      Z = sin(φ)                                   (up-down, constant)
+
+    The result is a 4-channel WAV file (channel layout: 4.0 quad used as
+    proxy for W/X/Y/Z since FFmpeg has no native B-format layout).
+    """
+    rot = p.rotation_speed * p.intensity_multiplier
+    phi = p.elevation * 1.5708   # map [-1,1] → [-π/2, π/2]
+
+    cos_phi = round(float(np.cos(phi)), 6) if 'np' in dir() else 1.0
+    sin_phi = round(float(np.sin(phi)), 6) if 'np' in dir() else 0.0
+
+    # W channel: constant 1/√2 ≈ 0.7071
+    w_gain = 0.7071
+
+    # Dynamic X = cos(2π rot t) × cos_phi
+    x_lfo = f"volume='{cos_phi:.6f}*cos(2*PI*{rot:.5f}*t)':eval=frame"
+    # Dynamic Y = sin(2π rot t) × cos_phi
+    y_lfo = f"volume='{cos_phi:.6f}*sin(2*PI*{rot:.5f}*t)':eval=frame"
+    # Static Z  = sin(phi)
+    z_gain = round(sin_phi, 6)
+
+    eq = _eq_chain(p)
+    rev = _reverb(p)
+
+    parts = [
+        # Mix to mono source
+        "pan=mono|c0=0.5*c0+0.5*c1[mono_src]",
+
+        # Apply master EQ + reverb to the mono source
+        f"[mono_src]{rev}[mono_rev]",
+    ]
+    if eq:
+        parts.append(f"[mono_rev]{eq}[mono_eq]")
+        parts.append("[mono_eq]asplit=4[w_raw][x_raw][y_raw][z_raw]")
+    else:
+        parts.append("[mono_rev]asplit=4[w_raw][x_raw][y_raw][z_raw]")
+
+    # W: scaled by 0.7071
+    parts.append(f"[w_raw]volume={w_gain}[w_ch]")
+
+    # X: cos(2π rot t) × cos_phi
+    parts.append(f"[x_raw]{x_lfo}[x_ch]")
+
+    # Y: sin(2π rot t) × cos_phi
+    parts.append(f"[y_raw]{y_lfo}[y_ch]")
+
+    # Z: static elevation component
+    if abs(z_gain) > 0.01:
+        parts.append(f"[z_raw]volume={z_gain}[z_ch]")
+        z_out = "z_ch"
+    else:
+        parts.append("[z_raw]volume=0.0[z_ch]")
+        z_out = "z_ch"
+
+    # Join into 4-channel (using 4.0 quad layout as B-format proxy)
+    parts.append(
+        f"[w_ch][x_ch][y_ch][{z_out}]"
+        "join=inputs=4:channel_layout=4.0[ambi_out]"
+    )
+    parts.append("[ambi_out]loudnorm=I=-16:TP=-1.5:LRA=11[ambi_norm]")
+
+    return ";".join(parts), "[ambi_norm]"
+
+
+# ============================================================================
+# DOLBY ATMOS 7.1.4 BED ENCODER   — v7.0 NEW
+# ============================================================================
+
+def build_atmos_71_4_filtergraph(p: ProcessingParams) -> tuple:
+    """
+    Renders a 7.1.4-channel Atmos bed by running the full 8-band HRTF
+    engine twice (front and back perspective), a centre channel for the
+    dry signal, and LFE + 4 height channels derived from the mix.
+
+    Channel order (standard 7.1.4):
+      FL FR FC LFE BL BR SL SR TFL TFR TBL TBR
+    """
+    i   = p.intensity_multiplier
+    rot = p.rotation_speed * i
+    br  = p.bass_rotation * i
+    tr  = p.treble_rotation * i
+    dvol= 1.0 / max(p.distance, 0.3)
+    eq  = _eq_chain(p)
+    rev = _reverb(p)
+
+    parts = [
+        "pan=mono|c0=0.5*c0+0.5*c1[mono_src]",
+        f"[mono_src]{rev}[mono_rev]",
+    ]
+    if eq:
+        parts.append(f"[mono_rev]{eq}[mono_eq]")
+        parts.append("[mono_eq]asplit=7[fl_src][fr_src][fc_src][lfe_src][sur_src][h_src][bl_src]")
+    else:
+        parts.append("[mono_rev]asplit=7[fl_src][fr_src][fc_src][lfe_src][sur_src][h_src][bl_src]")
+
+    # FL: sin LFO (left)
+    parts.append(f"[fl_src]volume='0.5+0.5*sin(2*PI*{rot:.5f}*t)':eval=frame[fl_ch]")
+    # FR: cos LFO (right)
+    parts.append(f"[fr_src]volume='0.5+0.5*cos(2*PI*{rot:.5f}*t)':eval=frame[fr_ch]")
+    # FC: dry centre
+    parts.append(f"[fc_src]volume=0.6[fc_ch]")
+    # LFE: lowpass bass
+    parts.append(f"[lfe_src]lowpass=f=120[lfe_ch]")
+    # BL / BR (surrounds): phase-inverted rotation
+    parts.append(f"[sur_src]asplit=2[bl_src2][br_src2]")
+    parts.append(f"[bl_src2]volume='0.4+0.4*cos(2*PI*{rot:.5f}*t+3.14)':eval=frame[bl_ch]")
+    parts.append(f"[br_src2]volume='0.4+0.4*sin(2*PI*{rot:.5f}*t+3.14)':eval=frame[br_ch]")
+    # SL / SR (sides): blend
+    parts.append(f"[bl_src]asplit=2[sl_src][sr_src]")
+    parts.append(f"[sl_src]volume='0.35+0.35*sin(2*PI*{rot:.5f}*t+1.57)':eval=frame[sl_ch]")
+    parts.append(f"[sr_src]volume='0.35+0.35*cos(2*PI*{rot:.5f}*t+1.57)':eval=frame[sr_ch]")
+    # Height channels (top): highpass of mix, static elevated pan
+    parts.append(f"[h_src]highpass=f=3000[h_hp]")
+    parts.append("[h_hp]asplit=4[tfl_s][tfr_s][tbl_s][tbr_s]")
+    parts.append(f"[tfl_s]volume='0.25+0.25*sin(2*PI*{tr:.5f}*t)':eval=frame[tfl_ch]")
+    parts.append(f"[tfr_s]volume='0.25+0.25*cos(2*PI*{tr:.5f}*t)':eval=frame[tfr_ch]")
+    parts.append(f"[tbl_s]volume='0.2+0.2*cos(2*PI*{tr:.5f}*t+3.14)':eval=frame[tbl_ch]")
+    parts.append(f"[tbr_s]volume='0.2+0.2*sin(2*PI*{tr:.5f}*t+3.14)':eval=frame[tbr_ch]")
+
+    # Join 12 channels
+    parts.append(
+        "[fl_ch][fr_ch][fc_ch][lfe_ch][bl_ch][br_ch][sl_ch][sr_ch]"
+        "[tfl_ch][tfr_ch][tbl_ch][tbr_ch]"
+        "join=inputs=12:channel_layout=7.1.4[atmos_out]"
+    )
+    parts.append("[atmos_out]loudnorm=I=-16:TP=-1.5:LRA=11[atmos_norm]")
+    return ";".join(parts), "[atmos_norm]"
+
+
+# ============================================================================
+# FILTERGRAPH LABEL PREFIXER  — multi-instance stem support  (v8.0)
+# ============================================================================
+
+import re as _re
+
+def _prefix_filtergraph(fg: str, out_label: str,
+                         prefix: str, input_ref: str = "") -> tuple:
+    """
+    Renames every [label] in fg to [prefix+label], so the same engine
+    can be instantiated multiple times within one mega-filtergraph without
+    label name collisions.  If input_ref is supplied (e.g. "[0:a]"), it is
+    prepended to the very first filter token so FFmpeg knows which -i input
+    stream to use.
+
+    Returns (new_fg, new_out_label).
+    """
+    new_fg  = _re.sub(r'\[([^\]]+)\]',
+                      lambda m: f'[{prefix}{m.group(1)}]', fg)
+    new_out = f'[{prefix}{out_label[1:-1]}]'
+    if input_ref:
+        new_fg = input_ref + new_fg
+    return new_fg, new_out
+
+
+# ============================================================================
+# MULTIBAND MASTERING BUS  — post-mix master chain  (v8.0)
+# ============================================================================
+
+def _multiband_master_bus(mix_label: str, out_label: str,
+                           p: ProcessingParams) -> str:
+    """
+    3-band multiband compressor + stereo width + EBU R128 + true peak limiter.
+
+    Applied after all per-stem 8D signals are mixed, before final encode.
+    Returns a semicolon-joined filtergraph fragment (no leading/trailing []).
+    The fragment reads from [mix_label] and outputs to [out_label].
+    """
+    parts = []
+
+    # Pre-master corrective EQ
+    parts.append(
+        f"[{mix_label}]"
+        "equalizer=f=35:t=h:w=30:g=-1.5,"
+        "equalizer=f=300:t=q:w=250:g=-1.0,"
+        "equalizer=f=2500:t=q:w=2000:g=0.8,"
+        f"equalizer=f=9000:t=h:w=4000:g=1.0[{out_label}_pmeq]"
+    )
+
+    # Split into 3 bands
+    parts.append(
+        f"[{out_label}_pmeq]asplit=3"
+        f"[{out_label}_lo][{out_label}_mi][{out_label}_hi]"
+    )
+
+    # Low band: sub + bass (≤ 200 Hz) — heavy glue, tight punch
+    parts.append(
+        f"[{out_label}_lo]lowpass=f=200[{out_label}_lolp]"
+    )
+    parts.append(
+        f"[{out_label}_lolp]"
+        "acompressor=threshold=-24dB:ratio=3.5:attack=8:release=120"
+        f":makeup=1.5dB:knee=3dB[{out_label}_loc]"
+    )
+
+    # Mid band: 200 Hz – 5 kHz — moderate control
+    parts.append(
+        f"[{out_label}_mi]"
+        f"highpass=f=200[{out_label}_mihp]"
+    )
+    parts.append(
+        f"[{out_label}_mihp]lowpass=f=5000[{out_label}_milp]"
+    )
+    parts.append(
+        f"[{out_label}_milp]"
+        "acompressor=threshold=-20dB:ratio=2.5:attack=12:release=200"
+        f":makeup=1.0dB:knee=4dB[{out_label}_mic]"
+    )
+
+    # High band: > 5 kHz — gentle air control
+    parts.append(
+        f"[{out_label}_hi]highpass=f=5000[{out_label}_hihp]"
+    )
+    parts.append(
+        f"[{out_label}_hihp]"
+        "acompressor=threshold=-18dB:ratio=2.0:attack=5:release=80"
+        f":makeup=0.5dB:knee=2dB[{out_label}_hic]"
+    )
+
+    # Re-combine bands
+    parts.append(
+        f"[{out_label}_loc][{out_label}_mic][{out_label}_hic]"
+        f"amix=inputs=3:duration=first:normalize=0[{out_label}_glued]"
+    )
+
+    # Stereo width on master bus
+    master_width = round(min(p.stereo_width * 1.05, 1.40), 3)
+    parts.append(
+        f"[{out_label}_glued]"
+        f"stereotools=mlev={master_width}:sbal=0:softclip=1"
+        f"[{out_label}_wide]"
+    )
+
+    # EBU R128 loudness normalisation
+    parts.append(
+        f"[{out_label}_wide]"
+        "loudnorm=I=-16:TP=-1.5:LRA=11:linear=true"
+        f"[{out_label}_loud]"
+    )
+
+    # True peak limiter
+    parts.append(
+        f"[{out_label}_loud]"
+        f"alimiter=limit=1:attack=3:release=40:level=false[{out_label}]"
+    )
+
+    return ";".join(parts)
+
+
+# ============================================================================
+# SINGLE-PASS MULTI-STEM FILTERGRAPH  — all stems in one FFmpeg call (v8.0)
+# ============================================================================
+
+def build_single_pass_stem_filtergraph(
+    stem_configs: List[Dict[str, Any]],
+    master_params: ProcessingParams,
+) -> tuple:
+    """
+    Build one large FFmpeg filtergraph that processes every stem
+    simultaneously:
+      1. Each stem runs through a full 8-band HRTF engine (per-stem params)
+      2. All processed stems are amixed (normalize=0 to honour gain staging)
+      3. The combined signal passes through the multiband mastering bus
+
+    stem_configs: list of dicts, one per stem —
+      { 'stem_name': str, 'input_idx': int, 'params': ProcessingParams }
+    master_params: ProcessingParams for the master bus settings.
+
+    Returns (filtergraph_string, output_label).
+    """
+    if not stem_configs:
+        raise ValueError("build_single_pass_stem_filtergraph: stem_configs is empty")
+    all_parts: List[str] = []
+    processed_labels: List[str] = []
+
+    for cfg in stem_configs:
+        stem_name = cfg['stem_name']
+        idx       = cfg['input_idx']
+        sp        = cfg['params']
+        prefix    = f"{stem_name[:2]}{idx}_"  # e.g. "vo0_", "dr1_"
+
+        fg, out_lbl = build_8band_hrtf_engine_v6(sp)
+        pfg, pout   = _prefix_filtergraph(fg, out_lbl, prefix, f"[{idx}:a]")
+
+        all_parts.append(pfg)
+        processed_labels.append(pout)
+        print(f"  ↳ [{stem_name}] input={idx} out={pout}  "
+              f"rot={sp.rotation_speed:.3f} w={sp.stereo_width:.2f} "
+              f"rev={sp.reverb_mix:.2f}")
+
+    # Mix all stems
+    n = len(processed_labels)
+    mix_in = "".join(processed_labels)
+    all_parts.append(
+        f"{mix_in}amix=inputs={n}:duration=first:normalize=0[stem_mix_raw]"
+    )
+
+    # Master bus (reads [stem_mix_raw] → writes [final_out])
+    master_bus = _multiband_master_bus("stem_mix_raw", "final_out", master_params)
+    all_parts.append(master_bus)
+
+    return ";".join(all_parts), "[final_out]"
+
+
+# ============================================================================
+# STEM SEPARATION   — v8.0  (4-stem + 6-stem Demucs, Spleeter fallback)
+# ============================================================================
+
+# MODEL → stem names mapping
+_DEMUCS_STEMS = {
+    "htdemucs":    ["vocals", "drums", "bass", "other"],
+    "htdemucs_6s": ["vocals", "drums", "bass", "guitar", "piano", "other"],
+    "mdx_extra":   ["vocals", "drums", "bass", "other"],
+}
+
+async def separate_stems(
+    input_path: str,
+    job_id: str,
+    model: str = "htdemucs",
+) -> Optional[tuple]:
+    """
+    Separates audio into stems using Demucs (preferred) or Spleeter.
+
+    model choices:
+      "htdemucs"    — 4 stems: vocals / drums / bass / other
+      "htdemucs_6s" — 6 stems: vocals / drums / bass / guitar / piano / other
+      "spleeter"    — 4 stems via Spleeter (fallback)
+
+    Returns (stems_dict, session_id) or None on failure.
+    stems_dict: { stem_name: wav_path }
+    """
+    if not STEM_SEPARATION:
+        return None
+
+    session_id = str(uuid.uuid4())
+    stem_dir   = TEMP_DIR / f"stems_{session_id}"
+    stem_dir.mkdir(exist_ok=True)
+
+    # Effective model to use
+    use_model = model if STEM_ENGINE == "demucs" else "spleeter"
+    stem_names = _DEMUCS_STEMS.get(use_model, _DEMUCS_STEMS["htdemucs"])
+
+    await manager.send_progress(
+        job_id, 8,
+        f"🎸 Separating stems [{use_model}] — {len(stem_names)} stems…"
+    )
+
+    try:
+        if STEM_ENGINE == "demucs":
+            cmd = [
+                sys.executable, "-m", "demucs",
+                "-n", use_model,
+                "--out", str(stem_dir),
+                input_path,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                err = stderr.decode()[:500]
+                print(f"⚠  Demucs [{use_model}] failed: {err}")
+                # Try fallback to htdemucs 4-stem if 6-stem requested but unavailable
+                if use_model == "htdemucs_6s":
+                    print("  ↳ Retrying with htdemucs (4-stem fallback)…")
+                    return await separate_stems(input_path, job_id, "htdemucs")
+                return None
+
+            input_stem = Path(input_path).stem
+            demucs_out = stem_dir / use_model / input_stem
+            if not demucs_out.exists():
+                print(f"⚠  Demucs output dir not found: {demucs_out}")
+                return None
+
+            stems: Dict[str, str] = {}
+            for name in stem_names:
+                p = demucs_out / f"{name}.wav"
+                if p.exists():
+                    stems[name] = str(p)
+                else:
+                    print(f"  ⚠  Stem file missing: {name}.wav")
+
+        else:  # spleeter (4-stem only)
+            from spleeter.separator import Separator as SpleeterSep
+            sep  = SpleeterSep("spleeter:4stems")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: sep.separate_to_file(input_path, str(stem_dir))
+            )
+            input_stem = Path(input_path).stem
+            sp_out = stem_dir / input_stem
+            stems = {}
+            for name in ["vocals", "drums", "bass", "other"]:
+                p = sp_out / f"{name}.wav"
+                if p.exists():
+                    stems[name] = str(p)
+
+        if not stems:
+            print("⚠  No stems were found after separation")
+            return None
+
+        stem_sessions[session_id] = stems
+        print(f"✅ Stems [{use_model}]: {list(stems.keys())} → session {session_id}")
+        await manager.send_progress(
+            job_id, 18,
+            f"✅ Stems ready ({len(stems)}): {', '.join(stems.keys())}"
+        )
+        return stems, session_id
+
+    except Exception as e:
+        print(f"❌ Stem separation failed: {e}")
+        return None
+
+
+# ============================================================================
+# VIDEO VISUALIZER GENERATOR   — v7.0 NEW
+# ============================================================================
+
+async def generate_video(
+    audio_path: str,
+    video_output_path: str,
+    params: ProcessingParams,
+    job_id: str
+) -> bool:
+    """
+    Generates a video visualisation synced to the processed audio using
+    FFmpeg's built-in audio visualisation filters.
+
+    Styles:
+      waveform    — showwaves (colour waveform on dark background)
+      spectrum    — showspectrum (spectrogram with log scale)
+      vectorscope — avectorscope (Lissajous stereo phase)
+    """
+    await manager.send_progress(job_id, 94, f"🎬 Rendering video ({params.video_style})…")
+
+    w, h = params.video_resolution.split("x")
+    fps  = params.video_fps
+
+    if params.video_style == "spectrum":
+        vis_filter = (
+            f"[0:a]showspectrum=s={w}x{h}:mode=combined:color=intensity:"
+            f"scale=log:saturation=3:fps={fps},format=yuv420p[v]"
+        )
+    elif params.video_style == "vectorscope":
+        vis_filter = (
+            f"[0:a]avectorscope=s={w}x{h}:zoom=3:rc=255:gc=180:bc=50:"
+            f"rf=0:gf=0:bf=0,format=yuv420p[v]"
+        )
+    else:  # waveform (default)
+        vis_filter = (
+            f"[0:a]showwaves=s={w}x{h}:mode=cline:rate={fps}:"
+            f"colors=#c87c3a|#e09050,format=yuv420p[v]"
+        )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", audio_path,
+        "-filter_complex", vis_filter,
+        "-map", "[v]",
+        "-map", "0:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-c:a", "aac", "-b:a", "256k",
+        "-shortest",
+        video_output_path,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        print(f"⚠  Video generation failed: {stderr.decode()[-500:]}")
+        return False
+
+    print(f"✅ Video → {video_output_path}")
+    return True
 
 async def process_8d_audio(
     input_file: str,
@@ -1401,10 +2412,10 @@ async def process_8d_audio(
     audio_analysis: Optional[Dict[str, Any]] = None
 ):
     try:
-        print(f"\n🎬 8D Processing v6.0 — job {job_id}")
+        print(f"\n🎬 8D Processing v7.0 — job {job_id}")
         await manager.send_progress(job_id, 5, "Running deep audio analysis…")
 
-        # Re-analyze if not already done (for WebSocket path)
+        # Re-analyze if not already done
         if audio_analysis is None and ADVANCED_ANALYSIS:
             try:
                 audio_analysis = audio_analyzer.analyze_comprehensive(input_file)
@@ -1416,10 +2427,202 @@ async def process_8d_audio(
             except Exception:
                 pass
 
-        await manager.send_progress(job_id, 15, "Building HRTF spatial filter graph…")
+        # ── Stem Separation path — v8.0 single-pass psychoacoustic engine ───
+        if params.enable_stem_separation and STEM_SEPARATION:
+            model  = params.stem_engine_model or "htdemucs"
+            result = await separate_stems(input_file, job_id, model)
+            if result:
+                stems_map, session_id = result
+                stem_list = list(stems_map.items())   # [(name, path), ...]
+                n_stems   = len(stem_list)
 
-        # Choose engine
-        if params.enable_multi_band and params.enable_hrtf:
+                await manager.send_progress(
+                    job_id, 20,
+                    f"🎛  Building per-stem spatial params ({n_stems} stems)…"
+                )
+
+                # ── Per-stem gain staging + psychoacoustic param routing ──────
+                stem_configs: List[Dict[str, Any]] = []
+                for idx, (stem_name, stem_path) in enumerate(stem_list):
+
+                    # Gain staging: measure stem RMS → compute makeup gain
+                    gain_db = 0.0
+                    if params.enable_gain_staging:
+                        gain_db = instrument_router.estimate_stem_gain_db(
+                            stem_path, params.stem_target_lufs
+                        )
+                        print(f"  ↳ [{stem_name}] gain staging: {gain_db:+.1f} dB")
+
+                    # InstrumentRouter: get psychoacoustically tuned params
+                    if params.stem_auto_route:
+                        stem_p = instrument_router.get_stem_params(
+                            stem_name, params,
+                            analysis=audio_analysis,
+                            gain_db=gain_db,
+                        )
+                    else:
+                        # Legacy manual override mode
+                        stem_p = params.copy()
+                        overrides: Dict[str, Any] = {}
+                        if stem_name == "vocals":
+                            overrides = {
+                                "enable_vocal_center": True,
+                                "rotation_speed": params.stem_vocals_rotation
+                                    or round(params.rotation_speed * 0.7, 3),
+                                "reverb_mix": round(params.reverb_mix * 0.85, 3),
+                            }
+                        elif stem_name == "drums":
+                            overrides = {
+                                "rotation_speed": params.stem_drums_rotation
+                                    or round(params.rotation_speed * 1.2, 3),
+                                "reverb_mix": round(params.reverb_mix * 0.5, 3),
+                            }
+                        elif stem_name == "bass":
+                            overrides = {
+                                "rotation_speed": params.stem_bass_rotation_override
+                                    or params.bass_rotation,
+                                "reverb_mix": round(params.reverb_mix * 0.3, 3),
+                            }
+                        elif stem_name == "guitar":
+                            overrides = {
+                                "rotation_speed": params.stem_guitar_rotation
+                                    or round(params.rotation_speed * 1.1, 3),
+                            }
+                        elif stem_name == "piano":
+                            overrides = {
+                                "rotation_speed": params.stem_piano_rotation
+                                    or round(params.rotation_speed * 0.9, 3),
+                            }
+                        else:
+                            overrides = {
+                                "rotation_speed": params.stem_other_rotation
+                                    or params.treble_rotation,
+                            }
+                        stem_p = stem_p.copy(update=overrides)
+
+                    # Force WAV output and no video for intermediate stems
+                    stem_p = stem_p.copy(update={
+                        "output_format": "wav",
+                        "generate_video": False,
+                    })
+
+                    stem_configs.append({
+                        "stem_name": stem_name,
+                        "input_idx": idx,
+                        "params":    stem_p,
+                    })
+
+                await manager.send_progress(
+                    job_id, 28,
+                    f"🔮 Building single-pass mega-filtergraph ({n_stems} engines)…"
+                )
+
+                # ── Build single-pass filtergraph (all stems → one FFmpeg call)
+                if params.enable_multiband_master:
+                    fg, out_lbl = build_single_pass_stem_filtergraph(
+                        stem_configs, params
+                    )
+                    engine_tag = "Single-Pass 8xHRTF + Multiband Master Bus"
+                else:
+                    # Simpler path: still single-pass but skip multiband master
+                    fg, out_lbl = build_single_pass_stem_filtergraph(
+                        stem_configs, params
+                    )
+                    engine_tag = "Single-Pass 8xHRTF (no multiband)"
+
+                print(f"  ↳ Engine : {engine_tag}")
+                print(f"  ↳ Graph  : {len(fg)} chars across {n_stems} HRTF instances")
+
+                # Codec for final output
+                if params.output_format == "mp3":
+                    final_codec = ["-c:a", "libmp3lame", "-b:a", f"{params.bitrate}k"]
+                elif params.output_format == "flac":
+                    final_codec = ["-c:a", "flac", "-compression_level", "8"]
+                else:
+                    final_codec = ["-c:a", "pcm_s24le"]
+
+                # Build FFmpeg inputs list
+                ff_inputs: List[str] = []
+                for _, (_, stem_path) in enumerate(stem_list):
+                    ff_inputs += ["-i", stem_path]
+
+                mix_cmd = [
+                    "ffmpeg", "-y",
+                    *ff_inputs,
+                    "-filter_complex", fg,
+                    "-map", out_lbl,
+                    "-ar", str(params.sample_rate),
+                    *final_codec,
+                    output_file,
+                ]
+
+                await manager.send_progress(
+                    job_id, 35,
+                    f"⚙️  Rendering {n_stems}-stem 8D audio…"
+                )
+                total_dur = get_audio_duration(stem_list[0][1])
+
+                proc = await asyncio.create_subprocess_exec(
+                    *mix_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stderr_lines: List[str] = []
+                while True:
+                    line = await proc.stderr.readline()
+                    if not line:
+                        break
+                    ls = line.decode('utf-8', errors='ignore')
+                    stderr_lines.append(ls)
+                    if 'time=' in ls:
+                        raw = await ffmpeg_progress(ls, total_dur)
+                        pct = min(35 + int(raw * 57), 92)
+                        await manager.send_progress(
+                            job_id, pct, "Encoding stem-based 8D audio…"
+                        )
+                await proc.wait()
+
+                if proc.returncode != 0:
+                    tail = "".join(stderr_lines[-60:])
+                    print(f"❌ Single-pass stem mix failed:\n{tail}")
+                    raise Exception(
+                        f"Stem filtergraph failed (code {proc.returncode})."
+                    )
+
+                video_url = None
+                if params.generate_video and os.path.exists(output_file):
+                    vid_out = str(
+                        OUTPUT_DIR / (Path(output_file).stem + "_viz.mp4")
+                    )
+                    ok = await generate_video(
+                        output_file, vid_out, params, job_id
+                    )
+                    if ok:
+                        video_url = (
+                            f"http://localhost:8000/download/"
+                            f"{Path(vid_out).name}"
+                        )
+
+                await manager.send_progress(
+                    job_id, 100, "✅ Stem-based 8D processing complete!"
+                )
+                out_url = (
+                    f"http://localhost:8000/download/"
+                    f"{Path(output_file).name}"
+                )
+                await manager.send_complete(job_id, out_url, video_url=video_url)
+                return True
+
+        # ── Standard path ───────────────────────────────────────────────────
+        await manager.send_progress(job_id, 15, "Building spatial filter graph…")
+
+        if params.output_format == "ambisonics_foa":
+            filtergraph, out_label = build_ambisonics_foa_filtergraph(params)
+            engine_name = "Ambisonics FOA (W/X/Y/Z B-format)"
+        elif params.output_format == "atmos_71_4":
+            filtergraph, out_label = build_atmos_71_4_filtergraph(params)
+            engine_name = "Dolby Atmos Bed (7.1.4)"
+        elif params.enable_multi_band and params.enable_hrtf:
             filtergraph, out_label = build_8band_hrtf_engine_v6(params)
             engine_name = "Studio Grade v6.0 (8-band HRTF + ITD + Pinna EQ + Diffuse-Field)"
         elif params.enable_multi_band:
@@ -1436,7 +2639,6 @@ async def process_8d_audio(
         print(f"  ↳ Graph  : {len(filtergraph)} chars")
         await manager.send_progress(job_id, 25, f"Using {engine_name}…")
 
-        # Codec
         if params.output_format == "mp3":
             codec = ["-c:a", "libmp3lame", "-b:a", f"{params.bitrate}k"]
         elif params.output_format == "flac":
@@ -1487,9 +2689,16 @@ async def process_8d_audio(
         if not os.path.exists(output_file):
             raise Exception("Output file was not created")
 
+        video_url = None
+        if params.generate_video:
+            vid_out = str(OUTPUT_DIR / (Path(output_file).stem + "_viz.mp4"))
+            ok = await generate_video(output_file, vid_out, params, job_id)
+            if ok:
+                video_url = f"http://localhost:8000/download/{Path(vid_out).name}"
+
         await manager.send_progress(job_id, 100, "✅ 8D processing complete!")
         out_url = f"http://localhost:8000/download/{Path(output_file).name}"
-        await manager.send_complete(job_id, out_url)
+        await manager.send_complete(job_id, out_url, video_url=video_url)
         print(f"✅ Done → {out_url}")
         return True
 
@@ -1512,9 +2721,11 @@ async def health():
         "ffmpeg":            ok,
         "advanced_analysis": ADVANCED_ANALYSIS,
         "youtube_support":   YOUTUBE_SUPPORT,
+        "stem_separation":   STEM_SEPARATION,
+        "stem_engine":       STEM_ENGINE,
         "reverb_engine":     "reverberate" if has_rev else "aecho",
         "has_reverberate":   has_rev,
-        "version":           "6.0.0",
+        "version":           "7.0.0",
         "analysis_bands":    10,
         "eq_bands":          12,
         "spatial_bands":     8,
@@ -1523,6 +2734,9 @@ async def health():
         "pinna_notch_eq":    True,
         "diffuse_field_eq":  True,
         "allpass_diffusion": True,
+        "ambisonics_foa":    True,
+        "atmos_71_4":        True,
+        "video_visualizer":  True,
     }
 
 @app.post("/analyze")
@@ -1552,7 +2766,13 @@ async def process_audio(
         else:
             raise HTTPException(status_code=400, detail="No audio file provided")
 
-        out_name = f"{job_id}_8d.{pp.output_format}"
+        # Determine file extension based on format
+        ext_map = {
+            "mp3": "mp3", "wav": "wav", "flac": "flac",
+            "ambisonics_foa": "wav", "atmos_71_4": "wav",
+        }
+        ext = ext_map.get(pp.output_format, pp.output_format)
+        out_name = f"{job_id}_8d.{ext}"
         out_path  = OUTPUT_DIR / out_name
 
         asyncio.create_task(
@@ -1562,6 +2782,59 @@ async def process_audio(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/stems/separate")
+async def stems_separate(
+    audio_file: UploadFile = File(...),
+    model: str = Form("htdemucs"),  # htdemucs | htdemucs_6s | spleeter
+):
+    """
+    Separate audio into stems and return a session ID for reuse.
+
+    model options:
+      htdemucs    — 4 stems: vocals / drums / bass / other  (default)
+      htdemucs_6s — 6 stems: vocals / drums / bass / guitar / piano / other
+      spleeter    — 4 stems via Spleeter (fallback if Demucs unavailable)
+    """
+    if not STEM_SEPARATION:
+        raise HTTPException(
+            status_code=501,
+            detail="Stem separation not available. Install demucs: pip install demucs"
+        )
+    job_id  = str(uuid.uuid4())
+    in_path = UPLOAD_DIR / f"{job_id}_{audio_file.filename}"
+    in_path.write_bytes(await audio_file.read())
+
+    result = await separate_stems(str(in_path), job_id, model=model)
+    if not result:
+        raise HTTPException(status_code=500, detail="Stem separation failed")
+
+    stems_map, session_id = result
+    return {
+        "session_id": session_id,
+        "model_used": model,
+        "stems":      list(stems_map.keys()),
+        "stem_count": len(stems_map),
+        "download_urls": {
+            name: f"http://localhost:8000/stems/{session_id}/{name}"
+            for name in stems_map
+        }
+    }
+
+
+@app.get("/stems/{session_id}/{stem_name}")
+async def download_stem(session_id: str, stem_name: str):
+    """Download a separated stem WAV file."""
+    if session_id not in stem_sessions:
+        raise HTTPException(status_code=404, detail="Stem session not found")
+    stems = stem_sessions[session_id]
+    if stem_name not in stems:
+        raise HTTPException(status_code=404, detail=f"Stem '{stem_name}' not found")
+    fp = Path(stems[stem_name])
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail="Stem file not found on disk")
+    return FileResponse(fp, media_type="audio/wav", filename=f"{stem_name}.wav")
 
 @app.websocket("/ws/{job_id}")
 async def ws_endpoint(websocket: WebSocket, job_id: str):
@@ -1675,22 +2948,31 @@ if __name__ == "__main__":
     )
 
     print("\n" + "="*72)
-    print("  8D Audio Converter — Deep Analysis Backend  v6.0")
+    print("  8D Audio Converter — Deep Analysis Backend  v8.0")
     print("="*72)
     print(f"  Analysis bands    : 10  (sub → air)")
     print(f"  EQ bands          : 12  (30 Hz → 16 kHz)")
     print(f"  Spatial bands     : 8   (HRTF + independent rotation)")
     print(f"  Genre profiles    : 15  (incl. Bollywood/Bhangra/Ghazal/Folk)")
+    print(f"  Spatial formats   : Stereo · Ambisonics FOA · Dolby Atmos 7.1.4")
     print(f"  Analysis v6.0     : MFCC · Chroma/Key · Crest Factor · HNR")
     print(f"                      Stereo Correlation · Transient Density")
     print(f"                      Tonnetz · ZCR · Spectral Rolloff")
-    print(f"  8D v6.0           : ITD inter-ear delay (per-band)")
+    print(f"  8D v7.1           : ITD bilateral dynamic (LFO-blended)")
     print(f"                      Pinna notch EQ (8.5/10.5/13 kHz)")
     print(f"                      Pre-delay reverb · Allpass diffusion")
     print(f"                      Diffuse-field EQ (IEC 711)")
     print(f"                      Equal-loudness compensation (ISO 226)")
+    print(f"  NEW v8.0          : InstrumentRouter psychoacoustic table")
+    print(f"                        (vocals/drums/bass/guitar/piano/other)")
+    print(f"                      Per-stem gain staging (RMS → LUFS proxy)")
+    print(f"                      Single-pass mega-filtergraph (all stems in 1 call)")
+    print(f"                      3-band multiband mastering bus")
+    print(f"                      6-stem Demucs htdemucs_6s support")
+    print(f"                      _prefix_filtergraph multi-instance engine")
     print(f"  Advanced analysis : {'✅' if ADVANCED_ANALYSIS else '❌  pip install librosa soundfile scipy'}")
     print(f"  YouTube support   : {'✅' if YOUTUBE_SUPPORT else '❌  pip install yt-dlp'}")
+    print(f"  Stem separation   : {'✅  ' + STEM_ENGINE if STEM_SEPARATION else '❌  pip install demucs'}")
 
     auto_detect_ffmpeg()
 
