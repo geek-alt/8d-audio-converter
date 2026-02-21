@@ -4,6 +4,6 @@ python-multipart==0.0.6
 librosa==0.10.1
 soundfile==0.12.1
 scipy==1.11.4
-yt-dlp==2024.1.7
+yt-dlp
 pydantic==2.5.3
 numpy==1.26.3
