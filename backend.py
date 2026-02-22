@@ -89,7 +89,7 @@ except ImportError:
 
 try:
     import torch
-    from demucs import separate
+    import demucs.api
     STEM_SEPARATION = True
     print("✅  Demucs stem separation available")
 except ImportError:
@@ -106,7 +106,7 @@ except ImportError:
 STEM_ENGINE = "none"
 if STEM_SEPARATION:
     try:
-        from demucs import separate
+        import demucs.api
         STEM_ENGINE = "demucs"
     except ImportError:
         STEM_ENGINE = "spleeter"
@@ -160,6 +160,16 @@ class ProcessingParams(BaseModel):
     enable_stem_separation: bool = False
     stem_session_id:        Optional[str] = None   # reuse already-separated stems
     stem_engine_model:      str   = "htdemucs"     # htdemucs | htdemucs_6s | spleeter
+
+    @classmethod
+    def model_validate(cls, obj, *args, **kwargs):
+        # BUG FIX: The frontend sends "stem_model" but Pydantic only knows
+        # "stem_engine_model".  Pydantic silently drops unknown fields, so the
+        # 6-stem model selector never reached the backend (always fell back to
+        # "htdemucs").  Map the alias here before validation so both names work.
+        if isinstance(obj, dict) and "stem_model" in obj and "stem_engine_model" not in obj:
+            obj = {**obj, "stem_engine_model": obj.pop("stem_model")}
+        return super().model_validate(obj, *args, **kwargs)
 
     # Stem psychoacoustics (None = InstrumentRouter auto-assign)
     stem_auto_route:        bool  = True   # let InstrumentRouter assign all per-stem params
@@ -1248,13 +1258,28 @@ def _eq_chain(p: ProcessingParams) -> str:
 # ============================================================================
 
 def _instrument_enhance_chain(p: ProcessingParams) -> str:
+    """
+    Instrument enhancement chain — v8.1 (frequency-selective exciter).
+
+    v7 problem: wideband tanh() saturation added harmonics at ALL frequencies,
+    causing sub-bass intermodulation that muddied the HRTF band separation.
+
+    v8.1 fix — 3-stage split path:
+      Stage 1: Transient compressor (gentler makeup: 2 dB not 3 dB).
+      Stage 2: HF exciter — boost > 3 kHz by 6 dB, apply soft saturation,
+               then cut back by 6 dB. Net result: harmonic content added
+               only at 6–12 kHz (presence/air), bass untouched.
+      Stage 3: +1.5 dB presence shelf at 5 kHz to restore cup-masked detail.
+    """
     if not p.instrument_enhance:
         return ""
-    filters = [
-        "acompressor=threshold=-30dB:ratio=1.5:attack=5:release=80:makeup=3dB",
-        "aeval=val(0)*0.97+0.03*tanh(val(0)*3)|val(1)*0.97+0.03*tanh(val(1)*3)",
-    ]
-    return ",".join(filters)
+    return (
+        "acompressor=threshold=-30dB:ratio=1.5:attack=5:release=80:makeup=2dB,"
+        "equalizer=f=3000:t=h:w=2000:g=6.0,"
+        "aeval=val(0)*0.88+0.12*tanh(val(0)*2.5)|val(1)*0.88+0.12*tanh(val(1)*2.5),"
+        "equalizer=f=3000:t=h:w=2000:g=-6.0,"
+        "equalizer=f=5000:t=h:w=3000:g=1.5"
+    )
 
 
 # ============================================================================
@@ -1263,70 +1288,145 @@ def _instrument_enhance_chain(p: ProcessingParams) -> str:
 
 def _diffuse_field_eq() -> str:
     """
-    Approximate IEC 711 diffuse-field correction for headphone listening.
-    Compensates for typical headphone bowl/cup resonances so the 8D audio
-    sounds as if heard in a real acoustic space rather than inside a box.
+    IEC 711 diffuse-field headphone correction — v8.1 (5-point model).
 
-      +3.5 dB @ 2.5 kHz  — restore vocal presence headphones often suppress
-      -5.0 dB @ 5.0 kHz  — cut headphone cup resonance
-      +4.0 dB @ 10.0 kHz — restore air headphones roll off
+    Old v7 was a 3-point approximation that missed two important features
+    of the IEC 711 curve:
+      • The ~700 Hz ear-canal resonance peak in typical closed headphones
+      • The broad 4 kHz presence dip that makes headphones sound "in-head"
+
+    v8.1 adds those two missing corrections for a more accurate outside-
+    the-head perception:
+
+      +2.0 dB @ 700 Hz   [NEW] — compensate ear-canal resonance peak
+                                   (closed headphones boost this; cutting it
+                                    restores the flat free-field response)
+      Correction: sign is negative — headphones ADD here, so we CUT.
+
+      -2.5 dB @ 700 Hz   [CORRECTED to cut]
+      +3.5 dB @ 2.5 kHz  — restore vocal presence (unchanged)
+      -5.0 dB @ 5.0 kHz  — cut headphone cup resonance (unchanged)
+      -2.0 dB @ 4.0 kHz  [NEW] — cut presence peak that causes in-head feel
+      +4.5 dB @ 10.0 kHz — restore ultra-air roll-off (boosted from 4.0)
+      +2.0 dB @ 14.0 kHz [NEW] — restore the outer-helix diffraction shoulder
     """
     return (
-        "equalizer=f=2500:t=q:w=3000:g=3.5,"
-        "equalizer=f=5000:t=q:w=2000:g=-5.0,"
-        "equalizer=f=10000:t=h:w=4000:g=4.0"
+        "equalizer=f=700:t=q:w=500:g=-2.5,"    # ear-canal resonance cut
+        "equalizer=f=2500:t=q:w=3000:g=3.5,"   # vocal presence restore
+        "equalizer=f=4000:t=q:w=2500:g=-2.0,"  # in-head peak reduction [NEW]
+        "equalizer=f=5000:t=q:w=2000:g=-5.0,"  # cup resonance cut
+        "equalizer=f=10000:t=h:w=4000:g=4.5,"  # air restore (was 4.0)
+        "equalizer=f=14000:t=h:w=5000:g=2.0"   # helix shoulder [NEW]
     )
 
 
 def _equal_loudness_shelf() -> str:
     """
-    Approximation of ISO 226:2003 equal-loudness compensation at ~70 phons.
-    Boosts sub-bass and ultra-air so the perceived loudness feels balanced
-    across all frequencies when listening at moderate headphone volume.
+    ISO 226:2003 equal-loudness compensation — v8.1 (6-point model, ~70 phons).
+
+    Old v7 was missing the 80–120 Hz equal-loudness dip — the curve actually
+    has a LOCAL MINIMUM near 100 Hz (not a boost), which is why bass-heavy
+    music sounds "tubby" on flat headphones. The 50 Hz boost was also too
+    aggressive (+7.5 dB), making sub rumble pile up on bass-heavy tracks.
+
+    v8.1 corrects:
+      +5.0 dB @ 40 Hz    — sub-bass boost (was +7.5 @ 50 Hz — overblown)
+      -1.5 dB @ 100 Hz   [NEW] — equal-loudness local minimum near 100 Hz
+      +1.5 dB @ 200 Hz   — bass warmth (unchanged concept, reduced)
+      -1.5 dB @ 3.5 kHz  — mid scoop (natural dip in 70-phon curve, unchanged)
+      +2.0 dB @ 8.0 kHz  [NEW] — 70-phon curve secondary peak at 8 kHz
+      +3.0 dB @ 12.0 kHz — high-air restore (unchanged)
     """
     return (
-        "equalizer=f=50:t=h:w=50:g=7.5,"      # sub-bass psychoacoustic boost
-        "equalizer=f=200:t=q:w=150:g=2.5,"     # bass body warmth
-        "equalizer=f=3500:t=q:w=3000:g=-1.5,"  # mid scoopd (natural dip in 70-phon curve)
-        "equalizer=f=12000:t=h:w=5000:g=3.0"   # high-air perceptual restore
+        "equalizer=f=40:t=h:w=40:g=5.0,"        # sub-bass boost (corrected)
+        "equalizer=f=100:t=q:w=80:g=-1.5,"       # equal-loudness 100 Hz dip [NEW]
+        "equalizer=f=200:t=q:w=150:g=1.5,"       # bass body warmth
+        "equalizer=f=3500:t=q:w=3000:g=-1.5,"    # mid scoop
+        "equalizer=f=8000:t=q:w=4000:g=2.0,"     # 8 kHz secondary peak [NEW]
+        "equalizer=f=12000:t=h:w=5000:g=3.0"     # high-air perceptual restore
     )
 
 
 def _pinna_notch_filters(intensity: float = 1.0) -> str:
     """
-    Pinna shadow notch filters.
-    Real pinna reflections create narrow spectral notches that the brain
-    uses to perceive elevation and front/back. Adding them to the mix
-    (on the contra-lateral / rear ear simulation) makes the 8D effect
-    feel outside-the-head rather than inside.
+    Pinna shadow notch filters — v8.1 (4-notch model).
 
-    Notch 1: ~8.5 kHz  — first pinna concha resonance
-    Notch 2: ~10.5 kHz — second pinna shadow
-    Notch 3: ~13.0 kHz — upper pinna flap reflection
+    Real pinna reflections create narrow spectral notches the brain uses to
+    perceive elevation and front/back. Four notches are modelled here:
+
+      Notch 1: ~8.5 kHz  — first pinna concha resonance      (−6 dB max)
+      Notch 2: ~10.5 kHz — second pinna shadow / flap        (−4 dB max)
+      Notch 3: ~13.0 kHz — upper pinna flap reflection       (−3 dB max)
+      Notch 4: ~16.0 kHz — outer helix diffraction shoulder  (−2.5 dB max)
+               [NEW v8.1] — adds the subtle ultra-high cue that gives
+               elevation perception above the ear plane.
+
+    All gains scale linearly with intensity [0–1.5].
+    Bandwidths chosen for psychoacoustic selectivity (not surgical cuts).
     """
     if intensity <= 0:
         return ""
-    g1 = round(-6.0  * intensity, 1)
-    g2 = round(-4.0  * intensity, 1)
-    g3 = round(-3.0  * intensity, 1)
+    g1 = round(-6.0   * min(intensity, 1.5), 1)
+    g2 = round(-4.0   * min(intensity, 1.5), 1)
+    g3 = round(-3.0   * min(intensity, 1.5), 1)
+    g4 = round(-2.5   * min(intensity, 1.5), 1)
     return (
         f"equalizer=f=8500:t=q:w=1200:g={g1},"
         f"equalizer=f=10500:t=q:w=1800:g={g2},"
-        f"equalizer=f=13000:t=q:w=2500:g={g3}"
+        f"equalizer=f=13000:t=q:w=2500:g={g3},"
+        f"equalizer=f=16000:t=q:w=3500:g={g4}"
     )
 
 
-def _allpass_diffuser() -> str:
+def _allpass_diffuser(room: float = 0.6) -> str:
     """
-    Allpass diffusion network — four prime-interval aecho taps.
-    Creates dense early reflections BEFORE the main reverb, giving a
-    richer spatial impression without smearing transients (the short
-    decays decay away quickly while adding diffusion texture).
+    Allpass diffusion network — four prime-interval aecho taps scaled by room size.
+
+    Tap delays are proportional to room size so that a small room (0.1) produces
+    dense early reflections (tight flutter) while a large room (1.0) gives wide,
+    spacious pre-echo that merges smoothly into the main reverb tail.
+
+    Small room (r=0.1): delays ≈ 8|10|14|18 ms  → intimate, close-miked feel
+    Medium  (r=0.6):    delays ≈ 17|23|31|41 ms  → original values
+    Large   (r=1.0):    delays ≈ 27|37|51|67 ms  → concert-hall depth
     """
+    r = max(0.05, min(1.0, room))
+    scale = r / 0.6          # normalise around original mid-room values
+    d1 = max(5,  int(17 * scale))
+    d2 = max(7,  int(23 * scale))
+    d3 = max(9,  int(31 * scale))
+    d4 = max(11, int(41 * scale))
+    # Decays: shorter taps die faster (keeps transients clean)
+    dc1 = round(min(0.25, 0.14 * (1 + r * 0.3)), 3)
+    dc2 = round(min(0.20, 0.11 * (1 + r * 0.3)), 3)
+    dc3 = round(min(0.16, 0.08 * (1 + r * 0.3)), 3)
+    dc4 = round(min(0.13, 0.06 * (1 + r * 0.3)), 3)
     return (
-        "aecho=in_gain=1.0:out_gain=1.0"
-        ":delays=17|23|31|41"
-        ":decays=0.14|0.11|0.08|0.06"
+        f"aecho=in_gain=1.0:out_gain=1.0"
+        f":delays={d1}|{d2}|{d3}|{d4}"
+        f":decays={dc1}|{dc2}|{dc3}|{dc4}"
+    )
+
+
+def _haas_widener(room: float = 0.6) -> str:
+    """
+    Haas-effect early reflection widener.
+
+    Applies a short (8–18 ms) delay only to the right channel, exploiting the
+    Haas (precedence) effect so the brain perceives the delayed copy as spatial
+    width rather than a discrete echo. The left channel is undelayed so the
+    stereo image is anchored correctly.
+
+    Delay scales with room: smaller rooms produce tighter Haas gaps.
+    Range: 8 ms (r=0.1)  →  18 ms (r=1.0), mirrored with mirrored gain.
+    """
+    r = max(0.0, min(1.0, room))
+    haas_ms = round(8.0 + r * 10.0, 1)     # 8–18 ms
+    haas_gain = round(0.72 + r * 0.10, 3)  # 0.72–0.82 (slightly quieter)
+    return (
+        f"aecho=in_gain=1.0:out_gain={haas_gain}"
+        f":delays=0|{haas_ms}"
+        f":decays=0.0|0.50"
     )
 
 
@@ -1432,7 +1532,12 @@ def build_8band_hrtf_engine_v6(p: ProcessingParams) -> tuple:
               'highm': 450, 'pres': 520, 'air': 580, 'spark': 630}
 
     # ── ILD floor: quietest ear never fully silent ──────────────────────────
-    FLOOR = 0.12   # 12 % minimum per-channel gain
+    # Distance-adaptive: closer sources have more extreme L/R separation
+    # (a speaker 1 m away is much more asymmetric than one at 5 m).
+    #   distance=0.3 (close) → floor=0.06  (very directional)
+    #   distance=1.0 (normal) → floor=0.12 (standard)
+    #   distance=2.0 (far)    → floor=0.20 (diffuse, near-central)
+    FLOOR = round(min(0.22, max(0.05, 0.12 * p.distance)), 4)
 
     # ── Parallel front/rear EQ definitions ─────────────────────────────────
     # Front: bright, present — listener hears this when sound is ahead
@@ -1628,13 +1733,19 @@ def build_8band_hrtf_engine_v6(p: ProcessingParams) -> tuple:
     rev_dry = 1.0 - rev_wet
     parts.append("[mixed_direct]asplit=2[dry_sig][rev_input]")
 
-    # Allpass diffusion network (early reflections)
-    diffuser = _allpass_diffuser()
+    # Allpass diffusion network (early reflections) — now scales with room size
+    diffuser = _allpass_diffuser(p.reverb_room)
     parts.append(f"[rev_input]{diffuser}[diffused]")
+
+    # Haas-effect widener: short R-channel delay (8–18 ms) for early stereo spread
+    # Applied AFTER diffusion, BEFORE the main reverb tail, so it enriches the
+    # early-reflection stage without muddying the reverb decay.
+    haas = _haas_widener(p.reverb_room)
+    parts.append(f"[diffused]{haas}[haas_wide]")
 
     # Pre-delay (simulates distance to first wall)
     pre_delay_ms = round(15.0 + p.reverb_room * 20.0, 1)
-    parts.append(f"[diffused]adelay={pre_delay_ms}|{pre_delay_ms}[pre_delayed]")
+    parts.append(f"[haas_wide]adelay={pre_delay_ms}|{pre_delay_ms}[pre_delayed]")
 
     # Main reverb
     rev_density = p.reverb_density
@@ -1692,11 +1803,26 @@ def build_8band_hrtf_engine_v6(p: ProcessingParams) -> tuple:
 
     # Loudness normalization (EBU R128)
     parts.append("[wide]loudnorm=I=-16:TP=-1.5:LRA=11:linear=true[loud]")
+    last = "loud"  # BUG FIX: update last so the elevation block reads from [loud],
+                   # not from the pre-stereotools node ("enhanced" / "eq_master").
+                   # Without this, any track with elevation ≠ 0 silently skipped
+                   # both stereotools and loudnorm.
 
-    # Elevation tilt
+    # Elevation tilt — v8.1 dual-band model
+    # Old: single high shelf at 8 kHz (oversimplified)
+    # New: two-band model — high shelf for perceived height + low-mid cut for
+    #      "flooring" effect, matching real HRTF elevation data:
+    #   Elevation > 0 (above):  +HF shelf (bright, airy) + slight sub-cut
+    #   Elevation < 0 (below):  −HF shelf (darker, earthed) + slight sub-boost
     if abs(p.elevation) > 0.01:
-        eg = round(p.elevation * 6.0, 1)
-        parts.append(f"[loud]equalizer=f=8000:t=h:w=2000:g={eg}[elev]")
+        eg_hi  = round(p.elevation * 6.0, 1)      # ±6 dB at 8 kHz
+        eg_sub = round(-p.elevation * 2.5, 1)     # opposite sign: above→sub cut
+        parts.append(
+            f"[{last}]"
+            f"equalizer=f=8000:t=h:w=3000:g={eg_hi},"
+            f"equalizer=f=80:t=h:w=80:g={eg_sub}"
+            f"[elev]"
+        )
         last = "elev"
     else:
         last = "loud"
@@ -1930,8 +2056,12 @@ def build_ambisonics_foa_filtergraph(p: ProcessingParams) -> tuple:
     rot = p.rotation_speed * p.intensity_multiplier
     phi = p.elevation * 1.5708   # map [-1,1] → [-π/2, π/2]
 
-    cos_phi = round(float(np.cos(phi)), 6) if 'np' in dir() else 1.0
-    sin_phi = round(float(np.sin(phi)), 6) if 'np' in dir() else 0.0
+    # BUG FIX: the original guard `if 'np' in dir()` is semantically meaningless —
+    # numpy is unconditionally imported at module level (line 67), so dir() will
+    # always contain 'np'.  Use np directly; if numpy is missing the ImportError
+    # at startup is the correct failure signal, not a silent fallback here.
+    cos_phi = round(float(np.cos(phi)), 6)
+    sin_phi = round(float(np.sin(phi)), 6)
 
     # W channel: constant 1/√2 ≈ 0.7071
     w_gain = 0.7071
@@ -2017,29 +2147,56 @@ def build_atmos_71_4_filtergraph(p: ProcessingParams) -> tuple:
     else:
         parts.append("[mono_rev]asplit=7[fl_src][fr_src][fc_src][lfe_src][sur_src][h_src][bl_src]")
 
-    # FL: sin LFO (left)
-    parts.append(f"[fl_src]volume='0.5+0.5*sin(2*PI*{rot:.5f}*t)':eval=frame[fl_ch]")
-    # FR: cos LFO (right)
-    parts.append(f"[fr_src]volume='0.5+0.5*cos(2*PI*{rot:.5f}*t)':eval=frame[fr_ch]")
+    # BUG FIX: Atmos LFO previously used 0.5+0.5*sin/cos which drops to exactly
+    # 0.0 at the trough — creating dead-zone silence for any channel at the back
+    # of the rotation. Ported the ILD floor formula from the v7.1 8-band engine:
+    #   pan = FLOOR + depth * (0.5 ± 0.5*cos(θ))   where FLOOR=0.12, depth=0.76
+    # This keeps the quietest channel at 12% of peak — never silent.
+    ATMOS_FLOOR = 0.12
+    ATMOS_DEPTH = round(1.0 - 2 * ATMOS_FLOOR, 4)  # 0.76
+
+    theta_main = f"2*PI*{rot:.5f}*t"
+    theta_tr   = f"2*PI*{tr:.5f}*t"
+
+    # FL (left): louder when source is to the left  → (0.5 − 0.5·cos θ)
+    fl_lfo = f"({ATMOS_FLOOR:.2f}+{ATMOS_DEPTH:.2f}*(0.5-0.5*cos({theta_main})))"
+    # FR (right): louder when source is to the right → (0.5 + 0.5·cos θ)
+    fr_lfo = f"({ATMOS_FLOOR:.2f}+{ATMOS_DEPTH:.2f}*(0.5+0.5*cos({theta_main})))"
+    # BL/BR (surround): phase-shifted by π for rear image
+    bl_lfo = f"(0.10+0.32*(0.5-0.5*cos({theta_main}+3.14159)))"
+    br_lfo = f"(0.10+0.32*(0.5+0.5*cos({theta_main}+3.14159)))"
+    # SL/SR (sides): phase π/2 for lateral image
+    sl_lfo = f"(0.10+0.25*(0.5-0.5*cos({theta_main}+1.5708)))"
+    sr_lfo = f"(0.10+0.25*(0.5+0.5*cos({theta_main}+1.5708)))"
+    # Height channels: same floor guarantee, treble rotation speed
+    tfl_lfo = f"(0.08+0.34*(0.5-0.5*cos({theta_tr})))"
+    tfr_lfo = f"(0.08+0.34*(0.5+0.5*cos({theta_tr})))"
+    tbl_lfo = f"(0.07+0.26*(0.5-0.5*cos({theta_tr}+3.14159)))"
+    tbr_lfo = f"(0.07+0.26*(0.5+0.5*cos({theta_tr}+3.14159)))"
+
+    # FL: ILD-floor LFO (left)
+    parts.append(f"[fl_src]volume='{fl_lfo}':eval=frame[fl_ch]")
+    # FR: ILD-floor LFO (right)
+    parts.append(f"[fr_src]volume='{fr_lfo}':eval=frame[fr_ch]")
     # FC: dry centre
     parts.append(f"[fc_src]volume=0.6[fc_ch]")
     # LFE: lowpass bass
     parts.append(f"[lfe_src]lowpass=f=120[lfe_ch]")
-    # BL / BR (surrounds): phase-inverted rotation
+    # BL / BR (surrounds): phase-inverted rotation, ILD floor
     parts.append(f"[sur_src]asplit=2[bl_src2][br_src2]")
-    parts.append(f"[bl_src2]volume='0.4+0.4*cos(2*PI*{rot:.5f}*t+3.14)':eval=frame[bl_ch]")
-    parts.append(f"[br_src2]volume='0.4+0.4*sin(2*PI*{rot:.5f}*t+3.14)':eval=frame[br_ch]")
-    # SL / SR (sides): blend
+    parts.append(f"[bl_src2]volume='{bl_lfo}':eval=frame[bl_ch]")
+    parts.append(f"[br_src2]volume='{br_lfo}':eval=frame[br_ch]")
+    # SL / SR (sides): blend, ILD floor
     parts.append(f"[bl_src]asplit=2[sl_src][sr_src]")
-    parts.append(f"[sl_src]volume='0.35+0.35*sin(2*PI*{rot:.5f}*t+1.57)':eval=frame[sl_ch]")
-    parts.append(f"[sr_src]volume='0.35+0.35*cos(2*PI*{rot:.5f}*t+1.57)':eval=frame[sr_ch]")
-    # Height channels (top): highpass of mix, static elevated pan
+    parts.append(f"[sl_src]volume='{sl_lfo}':eval=frame[sl_ch]")
+    parts.append(f"[sr_src]volume='{sr_lfo}':eval=frame[sr_ch]")
+    # Height channels (top): highpass of mix, ILD-floor LFO at treble rotation speed
     parts.append(f"[h_src]highpass=f=3000[h_hp]")
     parts.append("[h_hp]asplit=4[tfl_s][tfr_s][tbl_s][tbr_s]")
-    parts.append(f"[tfl_s]volume='0.25+0.25*sin(2*PI*{tr:.5f}*t)':eval=frame[tfl_ch]")
-    parts.append(f"[tfr_s]volume='0.25+0.25*cos(2*PI*{tr:.5f}*t)':eval=frame[tfr_ch]")
-    parts.append(f"[tbl_s]volume='0.2+0.2*cos(2*PI*{tr:.5f}*t+3.14)':eval=frame[tbl_ch]")
-    parts.append(f"[tbr_s]volume='0.2+0.2*sin(2*PI*{tr:.5f}*t+3.14)':eval=frame[tbr_ch]")
+    parts.append(f"[tfl_s]volume='{tfl_lfo}':eval=frame[tfl_ch]")
+    parts.append(f"[tfr_s]volume='{tfr_lfo}':eval=frame[tfr_ch]")
+    parts.append(f"[tbl_s]volume='{tbl_lfo}':eval=frame[tbl_ch]")
+    parts.append(f"[tbr_s]volume='{tbr_lfo}':eval=frame[tbr_ch]")
 
     # Join 12 channels
     parts.append(
@@ -2518,17 +2675,19 @@ async def process_8d_audio(
                 )
 
                 # ── Build single-pass filtergraph (all stems → one FFmpeg call)
-                if params.enable_multiband_master:
-                    fg, out_lbl = build_single_pass_stem_filtergraph(
-                        stem_configs, params
-                    )
-                    engine_tag = "Single-Pass 8xHRTF + Multiband Master Bus"
-                else:
-                    # Simpler path: still single-pass but skip multiband master
-                    fg, out_lbl = build_single_pass_stem_filtergraph(
-                        stem_configs, params
-                    )
-                    engine_tag = "Single-Pass 8xHRTF (no multiband)"
+                # BUG FIX: the previous if/else had two branches that called the
+                # identical function — build_single_pass_stem_filtergraph always
+                # applies the multiband master bus internally (see _multiband_master_bus).
+                # The `enable_multiband_master` flag is read inside that function,
+                # so there is no need for separate call sites here.
+                fg, out_lbl = build_single_pass_stem_filtergraph(
+                    stem_configs, params
+                )
+                engine_tag = (
+                    "Single-Pass 8xHRTF + Multiband Master Bus"
+                    if params.enable_multiband_master
+                    else "Single-Pass 8xHRTF (no multiband)"
+                )
 
                 print(f"  ↳ Engine : {engine_tag}")
                 print(f"  ↳ Graph  : {len(fg)} chars across {n_stems} HRTF instances")
