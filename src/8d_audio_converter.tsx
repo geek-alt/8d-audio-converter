@@ -721,6 +721,27 @@ const AudioConverter = () => {
   const [stemBassRotation, setStemBassRotation] = useState(null);
   const [stemOtherRotation, setStemOtherRotation] = useState(null);
   const [stemPreset, setStemPreset] = useState('auto');
+  // Per-stem width overrides
+  const [stemVocalsWidth, setStemVocalsWidth] = useState(null);
+  const [stemDrumsWidth, setStemDrumsWidth] = useState(null);
+  const [stemBassWidth, setStemBassWidth] = useState(null);
+  const [stemOtherWidth, setStemOtherWidth] = useState(null);
+  // Per-stem elevation overrides
+  const [stemVocalsElevation, setStemVocalsElevation] = useState(null);
+  const [stemDrumsElevation, setStemDrumsElevation] = useState(null);
+  const [stemBassElevation, setStemBassElevation] = useState(null);
+  const [stemOtherElevation, setStemOtherElevation] = useState(null);
+  // Per-stem reverb overrides
+  const [stemVocalsReverb, setStemVocalsReverb] = useState(null);
+  const [stemDrumsReverb, setStemDrumsReverb] = useState(null);
+  const [stemBassReverb, setStemBassReverb] = useState(null);
+  const [stemOtherReverb, setStemOtherReverb] = useState(null);
+  // Guitar/Piano (6-stem model)
+  const [stemGuitarRotation, setStemGuitarRotation] = useState(null);
+  const [stemGuitarWidth, setStemGuitarWidth] = useState(null);
+  const [stemPianoRotation, setStemPianoRotation] = useState(null);
+  const [stemPianoWidth, setStemPianoWidth] = useState(null);
+  const [stemModel, setStemModel] = useState('htdemucs');
 
   // Video Visualizer
   const [generateVideo, setGenerateVideo] = useState(false);
@@ -729,7 +750,7 @@ const AudioConverter = () => {
 
   // Backend
   const [backendStatus, setBackendStatus] = useState('checking');
-  const [wsConnection, setWsConnection] = useState(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const [audioAnalysis, setAudioAnalysis] = useState(null);
   const [reverbEngine, setReverbEngine] = useState('aecho');
   const [backendCaps, setBackendCaps] = useState({
@@ -766,11 +787,37 @@ const AudioConverter = () => {
   const fileInputRef = useRef(null);
   const batchFileInputRef = useRef(null);
   const audioElementRef = useRef(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   useEffect(() => {
     checkBackendHealth();
     const iv = setInterval(checkBackendHealth, 30000);
     return () => clearInterval(iv);
+  }, []);
+
+  // BUG FIX: wsRef was never cleaned up on unmount. If the user navigated away
+  // mid-processing, the WebSocket stayed open and its onmessage callback fired
+  // state setters on an unmounted component (React warning + potential memory leak).
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, []);
+
+  // BUG FIX (smaller): object URLs created by URL.createObjectURL are never
+  // revoked, leaking memory for every file the user loads. Track the current
+  // object URL and revoke it when a new file is loaded or the component unmounts.
+  const objectUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+    };
   }, []);
 
   const checkBackendHealth = async () => {
@@ -797,6 +844,7 @@ const AudioConverter = () => {
 
   const connectWebSocket = (jobId) => {
     const ws = new WebSocket(`ws://localhost:8000/ws/${jobId}`);
+    wsRef.current = ws;
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === 'progress') {
@@ -809,21 +857,28 @@ const AudioConverter = () => {
         setActiveTab('output');
         setIsProcessing(false);
         ws.close();
+        wsRef.current = null;
       } else if (data.type === 'error') {
         alert(`Processing error: ${data.message}`);
         setIsProcessing(false);
         ws.close();
+        wsRef.current = null;
       }
     };
-    ws.onerror = () => { setIsProcessing(false); };
-    setWsConnection(ws);
+    ws.onerror = () => { setIsProcessing(false); wsRef.current = null; };
   };
 
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setAudioFile(file);
-    setOriginalAudio(URL.createObjectURL(file));
+    // Revoke the previous object URL to free memory before creating a new one
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+    }
+    const url = URL.createObjectURL(file);
+    objectUrlRef.current = url;
+    setOriginalAudio(url);
     await analyzeAudio(file);
     setActiveTab('controls');
   };
@@ -891,10 +946,32 @@ const AudioConverter = () => {
       hrtf_intensity: hrtfIntensity,
       enable_limiter: true,
       enable_stem_separation: enableStemSeparation,
+      stem_engine_model: stemModel,  // BUG FIX: was "stem_model" — backend field is "stem_engine_model";
+                                     // Pydantic silently dropped the unknown key so htdemucs_6s was never used
       stem_vocals_rotation: svr,
       stem_drums_rotation: sdr,
       stem_bass_rotation_override: sbr,
       stem_other_rotation: sor,
+      // Per-stem width overrides
+      stem_vocals_width: stemVocalsWidth,
+      stem_drums_width: stemDrumsWidth,
+      stem_bass_width: stemBassWidth,
+      stem_other_width: stemOtherWidth,
+      // Per-stem elevation overrides
+      stem_vocals_elevation: stemVocalsElevation,
+      stem_drums_elevation: stemDrumsElevation,
+      stem_bass_elevation: stemBassElevation,
+      stem_other_elevation: stemOtherElevation,
+      // Per-stem reverb overrides
+      stem_vocals_reverb: stemVocalsReverb,
+      stem_drums_reverb: stemDrumsReverb,
+      stem_bass_reverb: stemBassReverb,
+      stem_other_reverb: stemOtherReverb,
+      // Guitar/Piano (6-stem model)
+      stem_guitar_rotation: stemGuitarRotation,
+      stem_guitar_width: stemGuitarWidth,
+      stem_piano_rotation: stemPianoRotation,
+      stem_piano_width: stemPianoWidth,
       generate_video: generateVideo,
       video_style: videoStyle,
       video_resolution: videoResolution,
@@ -985,7 +1062,21 @@ const AudioConverter = () => {
         setOriginalAudio(d.audio_url);
         setProgress(15);
         setActiveTab('controls');
-        await analyzeAudio(d.audio_url);
+        // BUG FIX: analyzeAudio expects a File/Blob — passing the raw URL string
+        // caused fd.append('file', urlString) to create a text FormData field,
+        // not a file upload, so /analyze received an empty or malformed file and
+        // analysis tags never populated for YouTube tracks.
+        // Solution: fetch the audio, wrap it as a Blob, then pass to analyzeAudio.
+        try {
+          const audioResp = await fetch(d.audio_url);
+          if (audioResp.ok) {
+            const audioBlob = await audioResp.blob();
+            const audioFile = new File([audioBlob], d.title + '.mp3', { type: 'audio/mpeg' });
+            await analyzeAudio(audioFile);
+          }
+        } catch {
+          // Analysis is best-effort; non-fatal if the fetch fails
+        }
       } else {
         alert('Download failed. Check the URL.');
       }
@@ -1294,26 +1385,43 @@ const AudioConverter = () => {
                       {/* Upload zone */}
                       <div
                         onClick={() => fileInputRef.current?.click()}
+                        onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
+                        onDragLeave={() => setIsDragging(false)}
+                        onDrop={e => {
+                          e.preventDefault();
+                          setIsDragging(false);
+                          const file = e.dataTransfer.files?.[0];
+                          if (file && (file.type.startsWith('audio/') || /\.(mp3|wav|m4a|flac|ogg)$/i.test(file.name))) {
+                            setAudioFile(file);
+                            setOriginalAudio(URL.createObjectURL(file));
+                            analyzeAudio(file);
+                            setActiveTab('controls');
+                          }
+                        }}
                         style={{
-                          border: '2px dashed #C8BCA8',
+                          border: `2px dashed ${isDragging ? '#C13318' : '#C8BCA8'}`,
                           borderRadius: 0,
                           padding: '56px 32px',
                           textAlign: 'center',
                           cursor: 'pointer',
                           transition: 'all 0.2s',
-                          background: '#F9F6F0',
+                          background: isDragging ? 'rgba(193, 51, 24, 0.04)' : '#F9F6F0',
                         }}
                         onMouseEnter={e => {
-                          e.currentTarget.style.borderColor = '#C13318';
-                          e.currentTarget.style.background = 'rgba(193, 51, 24, 0.02)';
+                          if (!isDragging) {
+                            e.currentTarget.style.borderColor = '#C13318';
+                            e.currentTarget.style.background = 'rgba(193, 51, 24, 0.02)';
+                          }
                         }}
                         onMouseLeave={e => {
-                          e.currentTarget.style.borderColor = '#C8BCA8';
-                          e.currentTarget.style.background = '#F9F6F0';
+                          if (!isDragging) {
+                            e.currentTarget.style.borderColor = '#C8BCA8';
+                            e.currentTarget.style.background = '#F9F6F0';
+                          }
                         }}
                       >
-                        <p className="meridian-body" style={{ fontSize: 15, color: '#1C1208', margin: '0 0 8px', fontWeight: 600 }}>
-                          Drop audio file here
+                        <p className="meridian-body" style={{ fontSize: 15, color: isDragging ? '#C13318' : '#1C1208', margin: '0 0 8px', fontWeight: 600 }}>
+                          {isDragging ? 'Drop to load' : 'Drop audio file here'}
                         </p>
                         <p className="meridian-mono" style={{ fontSize: 10, color: '#7A7060', margin: 0, letterSpacing: '0.06em' }}>
                           MP3 · WAV · M4A · FLAC · OGG
@@ -1658,39 +1766,95 @@ const AudioConverter = () => {
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                     {[
-                      { id: 'stereo', name: 'Stereo (Standard)', desc: 'Standard left/right for headphones & speakers' },
-                      { id: 'ambisonics_foa', name: 'Ambisonics FOA (B-Format)', desc: '4-channel first-order ambisonics (W, X, Y, Z)' },
-                      { id: 'atmos_71_4', name: 'Dolby Atmos 7.1.4', desc: '12-channel immersive bed layout' },
-                    ].map(format => (
-                      <div
-                        key={format.id}
-                        onClick={() => setSpatialFormat(format.id)}
-                        style={{
-                          padding: '18px 20px',
-                          border: spatialFormat === format.id ? '2px solid #C13318' : '1px solid #C8BCA8',
-                          borderRadius: 0,
-                          background: spatialFormat === format.id ? 'rgba(193, 51, 24, 0.04)' : '#F9F6F0',
-                          cursor: 'pointer',
-                          transition: 'all 0.2s',
-                        }}
-                      >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-                          <div style={{
-                            width: 12,
-                            height: 12,
-                            borderRadius: '50%',
-                            border: '2px solid ' + (spatialFormat === format.id ? '#C13318' : '#C8BCA8'),
-                            background: spatialFormat === format.id ? '#C13318' : 'transparent',
-                          }} />
-                          <span className="meridian-body" style={{ fontSize: 14, fontWeight: 600, color: '#1C1208' }}>
-                            {format.name}
-                          </span>
+                      {
+                        id: 'stereo',
+                        name: 'Stereo (Standard)',
+                        desc: 'Standard left/right for headphones & speakers',
+                        availability: 'Universal — works everywhere',
+                        note: null,
+                        badge: 'RECOMMENDED',
+                      },
+                      {
+                        id: 'ambisonics_foa',
+                        name: 'Ambisonics FOA (B-Format)',
+                        desc: '4-channel first-order ambisonics (W, X, Y, Z)',
+                        availability: backendCaps.ambisonics_foa ? 'Available' : 'Requires Ambisonics encoder',
+                        note: 'Outputs a 4-channel 24-bit WAV (B-format). Use a binaural decoder like SSA or IEM Binaural for headphone playback. Compatible with VR/360° environments and spatial audio DAW workflows.',
+                        badge: '4CH · 24-BIT WAV',
+                      },
+                      {
+                        id: 'atmos_71_4',
+                        name: 'Dolby Atmos 7.1.4',
+                        desc: '12-channel immersive bed layout',
+                        availability: backendCaps.atmos_71_4 ? 'Available' : 'Requires Atmos encoder',
+                        note: 'Outputs a 12-channel 24-bit WAV (L/R/C/LFE/Ls/Rs/Lss/Rss/Ltf/Rtf/Ltb/Rtb). Requires a Dolby Atmos rendering environment or compatible speakers/processor for proper playback.',
+                        badge: '12CH · 24-BIT WAV',
+                      },
+                    ].map(format => {
+                      const isSelected = spatialFormat === format.id;
+                      const isDisabled = (format.id === 'ambisonics_foa' && !backendCaps.ambisonics_foa) ||
+                                        (format.id === 'atmos_71_4' && !backendCaps.atmos_71_4);
+                      return (
+                        <div
+                          key={format.id}
+                          onClick={() => !isDisabled && setSpatialFormat(format.id)}
+                          style={{
+                            padding: '18px 20px',
+                            border: isSelected ? '2px solid #C13318' : '1px solid #C8BCA8',
+                            borderRadius: 0,
+                            background: isSelected ? 'rgba(193, 51, 24, 0.04)' : '#F9F6F0',
+                            cursor: isDisabled ? 'not-allowed' : 'pointer',
+                            opacity: isDisabled ? 0.5 : 1,
+                            transition: 'all 0.2s',
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 6 }}>
+                            <div style={{
+                              width: 12, height: 12, borderRadius: '50%', flexShrink: 0, marginTop: 3,
+                              border: '2px solid ' + (isSelected ? '#C13318' : '#C8BCA8'),
+                              background: isSelected ? '#C13318' : 'transparent',
+                            }} />
+                            <div style={{ flex: 1 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                                <span className="meridian-body" style={{ fontSize: 14, fontWeight: 600, color: '#1C1208' }}>
+                                  {format.name}
+                                </span>
+                                {format.badge && (
+                                  <span className="meridian-mono" style={{
+                                    fontSize: 9, letterSpacing: '0.1em', padding: '2px 7px',
+                                    background: isSelected ? 'rgba(193,51,24,0.1)' : '#EDE8DF',
+                                    color: isSelected ? '#C13318' : '#7A7060',
+                                    border: '1px solid ' + (isSelected ? 'rgba(193,51,24,0.25)' : '#C8BCA8'),
+                                  }}>
+                                    {format.badge}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="meridian-body" style={{ fontSize: 12, color: '#7A7060', margin: '4px 0 0' }}>
+                                {format.desc}
+                              </p>
+                              <p className="meridian-mono" style={{ fontSize: 10, color: isDisabled ? '#C13318' : '#2A7A3A', margin: '4px 0 0', letterSpacing: '0.04em' }}>
+                                {format.availability}
+                              </p>
+                            </div>
+                          </div>
+                          {/* Expanded notes panel for advanced formats */}
+                          {isSelected && format.note && (
+                            <div style={{
+                              marginTop: 12, marginLeft: 22,
+                              padding: '12px 14px',
+                              background: 'rgba(27, 56, 88, 0.04)',
+                              border: '1px solid rgba(27, 56, 88, 0.15)',
+                              borderRadius: 0,
+                            }}>
+                              <p className="meridian-body" style={{ fontSize: 11, color: '#1B3858', margin: 0, lineHeight: 1.7 }}>
+                                {format.note}
+                              </p>
+                            </div>
+                          )}
                         </div>
-                        <p className="meridian-body" style={{ fontSize: 12, color: '#7A7060', margin: '0 0 0 22px' }}>
-                          {format.desc}
-                        </p>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
 
                   <SectionDivider label="Output Settings" />
@@ -1729,7 +1893,7 @@ const AudioConverter = () => {
 
               {/* ═══ STEMS TAB ═══ */}
               {activeTab === 'stems' && (
-                <div style={{ maxWidth: 600 }}>
+                <div style={{ maxWidth: 680 }}>
                   <h3 className="meridian-display" style={{ fontSize: 24, margin: '0 0 28px', color: '#1C1208' }}>
                     Stem Separation
                   </h3>
@@ -1742,10 +1906,10 @@ const AudioConverter = () => {
                       borderRadius: 0,
                     }}>
                       <p className="meridian-body" style={{ fontSize: 13, color: '#C13318', fontWeight: 600, margin: '0 0 8px' }}>
-                        Stem separation not available
+                        Stem separation unavailable
                       </p>
                       <p className="meridian-mono" style={{ fontSize: 10, color: '#7A7060', margin: 0 }}>
-                        Install Demucs: pip install demucs
+                        Install Demucs to enable: <code style={{ color: '#1B3858' }}>pip install demucs</code>
                       </p>
                     </div>
                   ) : (
@@ -1762,15 +1926,53 @@ const AudioConverter = () => {
 
                       {enableStemSeparation && (
                         <>
+                          {/* GPU timing warning */}
+                          <div style={{
+                            marginBottom: 20,
+                            padding: '12px 16px',
+                            background: 'rgba(212, 144, 90, 0.08)',
+                            border: '1px solid rgba(212, 144, 90, 0.35)',
+                            borderRadius: 0,
+                            display: 'flex', alignItems: 'flex-start', gap: 10,
+                          }}>
+                            <span className="meridian-led meridian-led-amber" style={{ marginTop: 3 }} />
+                            <p className="meridian-body" style={{ fontSize: 12, color: '#7A7060', margin: 0, lineHeight: 1.6 }}>
+                              Stem separation adds <strong style={{ color: '#1C1208' }}>1–3 minutes</strong> per track. GPU recommended — CPU may take 5–10 min per track.
+                            </p>
+                          </div>
+
                           <p className="meridian-body" style={{ fontSize: 13, color: '#7A7060', marginBottom: 20, lineHeight: 1.6 }}>
-                            Separate audio into stems (vocals, drums, bass, other) and apply individual spatial processing to each.
+                            Separate audio into stems and apply individual spatial processing to each.
                           </p>
+
+                          {/* Stem Model */}
+                          <div style={{ marginBottom: 24 }}>
+                            <p className="meridian-section-label" style={{ marginBottom: 10 }}>
+                              Demucs Model
+                            </p>
+                            <div style={{ display: 'flex', gap: 8 }}>
+                              {[
+                                { id: 'htdemucs', label: 'htdemucs', desc: '4 stems' },
+                                { id: 'htdemucs_6s', label: 'htdemucs_6s', desc: '6 stems' },
+                              ].map(m => (
+                                <button
+                                  key={m.id}
+                                  className={`meridian-btn-secondary ${stemModel === m.id ? 'meridian-btn-selected' : ''}`}
+                                  onClick={() => setStemModel(m.id)}
+                                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2, padding: '10px 14px' }}
+                                >
+                                  <span style={{ fontWeight: 700 }}>{m.label}</span>
+                                  <span style={{ fontSize: 10, opacity: 0.7, textTransform: 'none', letterSpacing: 0 }}>{m.desc}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
 
                           <div style={{ marginBottom: 24 }}>
                             <p className="meridian-section-label" style={{ marginBottom: 12 }}>
                               Stem Preset
                             </p>
-                            <div style={{ display: 'flex', gap: 8 }}>
+                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                               {[
                                 { id: 'auto', label: 'Auto' },
                                 { id: 'vocals_front', label: 'Vocals Front' },
@@ -1788,47 +1990,147 @@ const AudioConverter = () => {
                             </div>
                           </div>
 
+                          {/* Preset summary grid for non-custom presets */}
+                          {stemPreset !== 'custom' && (
+                            <div style={{ marginBottom: 24 }}>
+                              <p className="meridian-section-label" style={{ marginBottom: 10 }}>
+                                Effective Rotation Per Stem
+                              </p>
+                              <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(4, 1fr)',
+                                gap: 1,
+                                background: '#C8BCA8',
+                                border: '1px solid #C8BCA8',
+                              }}>
+                                {[
+                                  { label: '🎤 Vocals', rot: stemPreset === 'vocals_front' ? rotationSpeed * 0.5 : stemPreset === 'drums_wide' ? rotationSpeed * 0.6 : rotationSpeed },
+                                  { label: '🥁 Drums', rot: stemPreset === 'vocals_front' ? rotationSpeed * 1.3 : stemPreset === 'drums_wide' ? trebleRotation * 1.5 : trebleRotation },
+                                  { label: '🎸 Bass', rot: stemPreset === 'vocals_front' ? bassRotation : stemPreset === 'drums_wide' ? bassRotation * 0.5 : bassRotation },
+                                  { label: '🎹 Other', rot: stemPreset === 'vocals_front' ? rotationSpeed * 0.9 : stemPreset === 'drums_wide' ? rotationSpeed : rotationSpeed },
+                                ].map(stem => (
+                                  <div key={stem.label} style={{ background: '#FEFDFB', padding: '12px 10px', textAlign: 'center' }}>
+                                    <p className="meridian-body" style={{ fontSize: 11, color: '#7A7060', margin: '0 0 6px' }}>{stem.label}</p>
+                                    <p className="meridian-mono" style={{ fontSize: 13, color: '#C13318', margin: 0, fontWeight: 600 }}>
+                                      {stem.rot.toFixed(2)} Hz
+                                    </p>
+                                    <p className="meridian-mono" style={{ fontSize: 9, color: '#7A7060', margin: '3px 0 0' }}>
+                                      {(stem.rot * 60).toFixed(1)} RPM
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
                           {stemPreset === 'custom' && (
                             <>
-                              <SectionDivider label="Per-Stem Rotation" />
-                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px 24px' }}>
-                                <SliderRow
-                                  label="Vocals"
-                                  value={stemVocalsRotation || rotationSpeed}
-                                  min={0.01}
-                                  max={0.6}
-                                  step={0.01}
-                                  onChange={setStemVocalsRotation}
-                                  unit=" Hz"
-                                />
-                                <SliderRow
-                                  label="Drums"
-                                  value={stemDrumsRotation || trebleRotation}
-                                  min={0.01}
-                                  max={0.6}
-                                  step={0.01}
-                                  onChange={setStemDrumsRotation}
-                                  unit=" Hz"
-                                />
-                                <SliderRow
-                                  label="Bass"
-                                  value={stemBassRotation || bassRotation}
-                                  min={0.01}
-                                  max={0.3}
-                                  step={0.01}
-                                  onChange={setStemBassRotation}
-                                  unit=" Hz"
-                                />
-                                <SliderRow
-                                  label="Other"
-                                  value={stemOtherRotation || rotationSpeed}
-                                  min={0.01}
-                                  max={0.6}
-                                  step={0.01}
-                                  onChange={setStemOtherRotation}
-                                  unit=" Hz"
-                                />
+                              <SectionDivider label="Per-Stem Controls" />
+                              {/* 5-column header */}
+                              <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: '80px 1fr 1fr 1fr 1fr',
+                                gap: 8,
+                                marginBottom: 8,
+                                paddingBottom: 8,
+                                borderBottom: '1px solid #C8BCA8',
+                              }}>
+                                {['Stem', 'Rotation', 'Width', 'Elevation', 'Reverb Mix'].map(h => (
+                                  <span key={h} className="meridian-section-label" style={{ fontSize: 9 }}>{h}</span>
+                                ))}
                               </div>
+                              {/* Stem rows */}
+                              {[
+                                {
+                                  emoji: '🎤', label: 'Vocals',
+                                  rot: stemVocalsRotation ?? rotationSpeed, setRot: setStemVocalsRotation, rotMax: 0.6,
+                                  wid: stemVocalsWidth ?? stereoWidth, setWid: setStemVocalsWidth,
+                                  elev: stemVocalsElevation ?? elevation, setElev: setStemVocalsElevation,
+                                  rev: stemVocalsReverb ?? reverbMix, setRev: setStemVocalsReverb,
+                                },
+                                {
+                                  emoji: '🥁', label: 'Drums',
+                                  rot: stemDrumsRotation ?? trebleRotation, setRot: setStemDrumsRotation, rotMax: 0.8,
+                                  wid: stemDrumsWidth ?? stereoWidth, setWid: setStemDrumsWidth,
+                                  elev: stemDrumsElevation ?? elevation, setElev: setStemDrumsElevation,
+                                  rev: stemDrumsReverb ?? reverbMix, setRev: setStemDrumsReverb,
+                                },
+                                {
+                                  emoji: '🎸', label: 'Bass',
+                                  rot: stemBassRotation ?? bassRotation, setRot: setStemBassRotation, rotMax: 0.3,
+                                  wid: stemBassWidth ?? stereoWidth, setWid: setStemBassWidth,
+                                  elev: stemBassElevation ?? elevation, setElev: setStemBassElevation,
+                                  rev: stemBassReverb ?? reverbMix, setRev: setStemBassReverb,
+                                },
+                                {
+                                  emoji: '🎹', label: 'Other',
+                                  rot: stemOtherRotation ?? rotationSpeed, setRot: setStemOtherRotation, rotMax: 0.6,
+                                  wid: stemOtherWidth ?? stereoWidth, setWid: setStemOtherWidth,
+                                  elev: stemOtherElevation ?? elevation, setElev: setStemOtherElevation,
+                                  rev: stemOtherReverb ?? reverbMix, setRev: setStemOtherReverb,
+                                },
+                                ...(stemModel === 'htdemucs_6s' ? [
+                                  {
+                                    emoji: '🎺', label: 'Guitar',
+                                    rot: stemGuitarRotation ?? rotationSpeed, setRot: setStemGuitarRotation, rotMax: 0.6,
+                                    wid: stemGuitarWidth ?? stereoWidth, setWid: setStemGuitarWidth,
+                                    elev: null, setElev: null,
+                                    rev: null, setRev: null,
+                                  },
+                                  {
+                                    emoji: '🎵', label: 'Piano',
+                                    rot: stemPianoRotation ?? rotationSpeed, setRot: setStemPianoRotation, rotMax: 0.6,
+                                    wid: stemPianoWidth ?? stereoWidth, setWid: setStemPianoWidth,
+                                    elev: null, setElev: null,
+                                    rev: null, setRev: null,
+                                  },
+                                ] : []),
+                              ].map(stem => (
+                                <div key={stem.label} style={{
+                                  display: 'grid',
+                                  gridTemplateColumns: '80px 1fr 1fr 1fr 1fr',
+                                  gap: 8,
+                                  alignItems: 'center',
+                                  padding: '10px 0',
+                                  borderBottom: '1px solid #E8E0D2',
+                                }}>
+                                  <span className="meridian-body" style={{ fontSize: 12, color: '#1C1208', fontWeight: 600 }}>
+                                    {stem.emoji} {stem.label}
+                                  </span>
+                                  {/* Rotation */}
+                                  <div>
+                                    <input type="range" min={0.01} max={stem.rotMax} step={0.01} value={stem.rot}
+                                      onChange={e => stem.setRot(parseFloat(e.target.value))} />
+                                    <span className="meridian-value meridian-mono" style={{ fontSize: 9 }}>{stem.rot.toFixed(2)} Hz</span>
+                                  </div>
+                                  {/* Width */}
+                                  <div>
+                                    <input type="range" min={0.5} max={2.0} step={0.05} value={stem.wid}
+                                      onChange={e => stem.setWid(parseFloat(e.target.value))} />
+                                    <span className="meridian-value meridian-mono" style={{ fontSize: 9 }}>{stem.wid.toFixed(2)}</span>
+                                  </div>
+                                  {/* Elevation */}
+                                  <div>
+                                    {stem.elev !== null && stem.setElev ? (
+                                      <>
+                                        <input type="range" min={-0.3} max={0.3} step={0.01} value={stem.elev}
+                                          onChange={e => stem.setElev(parseFloat(e.target.value))} />
+                                        <span className="meridian-value meridian-mono" style={{ fontSize: 9 }}>{stem.elev >= 0 ? '+' : ''}{stem.elev.toFixed(2)}</span>
+                                      </>
+                                    ) : <span className="meridian-mono" style={{ fontSize: 9, color: '#C8BCA8' }}>—</span>}
+                                  </div>
+                                  {/* Reverb Mix */}
+                                  <div>
+                                    {stem.rev !== null && stem.setRev ? (
+                                      <>
+                                        <input type="range" min={0.0} max={0.7} step={0.01} value={stem.rev}
+                                          onChange={e => stem.setRev(parseFloat(e.target.value))} />
+                                        <span className="meridian-value meridian-mono" style={{ fontSize: 9 }}>{stem.rev.toFixed(2)}</span>
+                                      </>
+                                    ) : <span className="meridian-mono" style={{ fontSize: 9, color: '#C8BCA8' }}>—</span>}
+                                  </div>
+                                </div>
+                              ))}
                             </>
                           )}
                         </>
@@ -1883,7 +2185,7 @@ const AudioConverter = () => {
                           Resolution
                         </p>
                         <div style={{ display: 'flex', gap: 8 }}>
-                          {['1280x720', '1920x1080', '3840x2160'].map(res => (
+                          {['854x480', '1280x720', '1920x1080', '3840x2160'].map(res => (
                             <button
                               key={res}
                               className={`meridian-btn-secondary ${videoResolution === res ? 'meridian-btn-selected' : ''}`}
