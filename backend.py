@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-8D Audio Converter — Deep Analysis Backend v6.0
+8D Audio Converter — Deep Analysis Backend v9.0
 ================================================
 
 ANALYSIS ENGINE  (v6.0 additions over v4.0)
@@ -18,7 +18,19 @@ ANALYSIS ENGINE  (v6.0 additions over v4.0)
   ✦ Enhanced _optimize_parameters: uses crest factor, mode, transient
     density, stereo correlation, and HNR to fine-tune every parameter
 
-8D ENGINE  (v6.0 additions)
+8D ENGINE  (v9.0 — full feature set)
+  ✦ HRIR Convolution Engine (NEW in v9.0) — breaks the FFmpeg ceiling:
+      Real Head-Related Impulse Response convolution using scipy.signal.fftconvolve
+      Woodworth ITD model + Duda/Martens ILD + pinna notch resonances
+      OLA (overlap-add) block processing for time-varying spatial position
+      Optional KEMAR dataset support (drop kemar_hrirs.npy alongside backend.py)
+  ✦ Beat-Locked Rotation (NEW in v9.0):
+      Beat positions from librosa drive a piecewise-linear LFO
+      Source returns to the same azimuth on every beat — no drift
+      Falls back to BPM-synced free-running LFO if no beat data
+  ✦ Dual-Band Elevation v8.1 (ported to ALL engines):
+      HF shelf at 8 kHz + sub cut/boost at 80 Hz
+      Previously only in the 8-band engine; now in simple/vocal/6-band too
   ✦ ITD (Interaural Time Difference) simulation via per-band static
     channel delays — higher bands get up to 630 μs inter-ear offset
   ✦ Pinna notch filters: narrow EQ cuts at ~8.5 kHz and ~10.5 kHz
@@ -26,33 +38,26 @@ ANALYSIS ENGINE  (v6.0 additions over v4.0)
   ✦ Pre-reverb delay (15–35 ms) — simulates room distance
   ✦ Allpass diffusion network — series of 4 prime-spaced aecho taps
     before the main reverb for richer early reflections
-  ✦ Diffuse-field EQ (IEC 711 compensation for headphone listening):
-    boosts 2.5 kHz presence, cuts 5 kHz cup resonance, adds 10 kHz air
+  ✦ Diffuse-field EQ (IEC 711 compensation for headphone listening)
   ✦ Equal-loudness compensation shelf (Fletcher-Munson at 70 phons)
   ✦ Frequency-dependent stereo width (lows narrower, highs wider)
   ✦ Per-band hard limiter before amix to prevent inter-band clipping
-  ✦ Phase rotation awareness — alternates LFO phase offset per band to
-    avoid comb-filter cancellations at the crossover frequencies
+  ✦ Phase rotation awareness — alternates LFO phase offset per band
+
+INFRASTRUCTURE  (v9.0)
+  ✦ TTL eviction: stem sessions + batch queues auto-purged after 2 hours
+  ✦ Cancel endpoint: DELETE /process/{job_id} terminates FFmpeg + asyncio task
+  ✦ Active proc registry: _active_procs / _active_tasks for clean teardown
 
 FILTERGRAPH ENGINES  (all retained + enhanced)
-  ✦ Studio Grade v6.0  — 8-band HRTF + ITD + pinna EQ + diffuse-field
-  ✦ 6-band multiband   — for enable_multi_band without full HRTF
-  ✦ Vocal-aware 3-band — legacy vocal center mode
-  ✦ Simple 2-channel   — fallback for minimal FFmpeg installations
+  ✦ HRIR Convolution + Mastering  v9.0 — Python HRIR → FFmpeg reverb/EQ
+  ✦ Studio Grade v9.0             — 8-band HRTF + beat-locked ITD + pinna
+  ✦ 6-band multiband              — for enable_multi_band without full HRTF
+  ✦ Vocal-aware 3-band            — legacy vocal center mode
+  ✦ Simple 2-channel              — fallback for minimal FFmpeg installations
 
 EQ  (12-band, unchanged API)
-  ✦ 30 Hz sub rumble shelf
-  ✦ 60 Hz sub punch bell
-  ✦ 100 Hz bass warmth bell
-  ✦ 200 Hz upper-bass body bell
-  ✦ 350 Hz mud cut bell
-  ✦ 700 Hz nasal cut bell
-  ✦ 1500 Hz instrument bite bell
-  ✦ 3000 Hz presence bell
-  ✦ 5000 Hz definition bell
-  ✦ 8000 Hz brilliance shelf
-  ✦ 12000 Hz air shimmer shelf
-  ✦ 16000 Hz ultra-air shelf
+  ✦ 30 / 60 / 100 / 200 / 350 / 700 / 1500 / 3000 / 5000 / 8000 / 12000 / 16000 Hz
 """
 
 import os
@@ -81,38 +86,57 @@ except ImportError:
     ADVANCED_ANALYSIS = False
 
 try:
+    import h5py
+    H5PY_AVAILABLE = True
+except ImportError:
+    H5PY_AVAILABLE = False
+    print("⚠️  SOFA/HDF5 support disabled. Run: pip install h5py")
+
+try:
     import yt_dlp
     YOUTUBE_SUPPORT = True
 except ImportError:
     print("⚠️  YouTube disabled. Run: pip install yt-dlp")
     YOUTUBE_SUPPORT = False
 
+# Demucs 4.x uses `from demucs.api import Separator`; older versions used
+# `import demucs.api`.  We import Separator directly so the runtime path also
+# uses the 4.x API.  The `STEM_ENGINE` flag is set exactly once here —
+# the old code had a second detection block that unconditionally reset it to
+# "none" even after a successful import, silently disabling stem separation.
+STEM_ENGINE     = "none"
+STEM_SEPARATION = False
+
 try:
     import torch
-    import demucs.api
+    import demucs                                        # noqa: F401 (version check)
+    from demucs.api import Separator as DemucsSeperator  # 4.x API
     STEM_SEPARATION = True
-    print("✅  Demucs stem separation available")
-except ImportError:
+    STEM_ENGINE     = "demucs"
+    _dv = getattr(demucs, "__version__", "4.x")
+    print(f"✅  Demucs stem separation available (v{_dv})")
+except ImportError as _e:
+    print(f"⚠️  Demucs import failed: {_e}")
     try:
         from spleeter.separator import Separator as SpleeterSeparator
         STEM_SEPARATION = True
-        STEM_ENGINE = "spleeter"
-        print("✅  Spleeter stem separation available")
-    except ImportError:
-        STEM_SEPARATION = False
-        print("⚠️  Stem separation disabled. Run: pip install demucs  (or spleeter)")
+        STEM_ENGINE     = "spleeter"
+        print("✅  Spleeter stem separation available (fallback)")
+    except ImportError as _e2:
+        print(f"⚠️  Spleeter import failed: {_e2}")
+        print("❌  Stem separation DISABLED — run: pip install demucs")
 
-# Detect stem engine
-STEM_ENGINE = "none"
-if STEM_SEPARATION:
-    try:
-        import demucs.api
-        STEM_ENGINE = "demucs"
-    except ImportError:
-        STEM_ENGINE = "spleeter"
+print(f"📊  Stem engine: {STEM_ENGINE} | Available: {STEM_SEPARATION}")
 
 # Stem cache: session_id -> {stem_name: path}
 stem_sessions: Dict[str, Dict[str, str]] = {}
+# Timestamps for TTL eviction: session_id / batch_id -> creation time (epoch seconds)
+_session_timestamps: Dict[str, float] = {}
+# Active FFmpeg subprocesses: job_id -> asyncio.subprocess.Process
+# Used by the cancel endpoint to terminate in-flight jobs.
+_active_procs: Dict[str, Any] = {}
+# Active asyncio Tasks: job_id -> Task — used to cancel the coroutine itself
+_active_tasks: Dict[str, asyncio.Task] = {}
 
 # ============================================================================
 # APP SETUP
@@ -216,18 +240,18 @@ class ProcessingParams(BaseModel):
     video_fps:       int  = 25
 
     # 12-band EQ (dB)
-    eq_sub30_gain:       float =  3.0
-    eq_sub60_gain:       float =  4.0
-    eq_bass100_gain:     float =  3.0
-    eq_ubass200_gain:    float =  1.5
+    eq_sub30_gain:       float =  7.0   # +3→+7: punchier sub-bass
+    eq_sub60_gain:       float =  8.0   # +4→+8: deeper bass
+    eq_bass100_gain:     float =  5.0   # +3→+5: bass body
+    eq_ubass200_gain:    float =  2.5   # +1.5→+2.5: upper bass
     eq_lowmid350_gain:   float = -2.5
-    eq_mid700_gain:      float = -1.0
-    eq_umid1500_gain:    float =  1.0
-    eq_presence3k_gain:  float =  2.0
-    eq_def5k_gain:       float =  1.5
-    eq_bril8k_gain:      float =  2.0
-    eq_air12k_gain:      float =  2.0
-    eq_uair16k_gain:     float =  1.0
+    eq_mid700_gain:      float = -0.5   # -1→-0.5: less vocal cut
+    eq_umid1500_gain:    float =  2.0   # +1→+2: vocal clarity
+    eq_presence3k_gain:  float =  3.5   # +2→+3.5: presence
+    eq_def5k_gain:       float =  2.5   # +1.5→+2.5: definition
+    eq_bril8k_gain:      float =  3.0   # +2→+3: brilliance
+    eq_air12k_gain:      float =  5.0   # +2→+5: air/sparkle
+    eq_uair16k_gain:     float =  3.0   # +1→+3: ultra-air
 
     # Legacy aliases (absorbed into new bands)
     eq_sub_bass_gain:    float =  0.0
@@ -245,6 +269,18 @@ class ProcessingParams(BaseModel):
     hrtf_intensity:   float = 1.0
     enable_limiter:   bool  = True
 
+    # Preset management
+    preset_id: Optional[str] = None  # genre key or 'auto'
+
+    @classmethod
+    def apply_preset(cls, base: 'ProcessingParams', preset_data: Dict[str, Any]) -> 'ProcessingParams':
+        """Merge preset dict into ProcessingParams, ignoring unknown keys."""
+        valid = {
+            k: v for k, v in preset_data.items()
+            if k in cls.model_fields and k != 'name'
+        }
+        return base.model_copy(update=valid)
+
 
 class YouTubeDownloadRequest(BaseModel):
     url: str
@@ -258,6 +294,400 @@ class BatchJob(BaseModel):
     error:      Optional[str] = None
 
 batch_queue: Dict[str, List[BatchJob]] = {}
+
+
+# ============================================================================
+# PRESET LIBRARY v2.0 — Genre & Characteristic-Based Presets
+# ============================================================================
+
+class PresetLibrary:
+    """
+    Comprehensive preset library with automatic selection based on audio analysis.
+    Each preset defines rotation, reverb, EQ, and spatial params optimised for
+    a specific music style or spectral characteristic.
+    """
+
+    GENRE_PRESETS: Dict[str, Dict[str, Any]] = {
+        # ── Electronic ────────────────────────────────────────────────────────
+        'electronic': {
+            'name': 'Electronic Pulse',
+            'rotation_speed': 0.22, 'bass_rotation': 0.10, 'treble_rotation': 0.35,
+            'reverb_room': 0.65, 'reverb_mix': 0.28, 'reverb_density': 0.75,
+            'stereo_width': 1.35, 'elevation': 0.05, 'distance': 0.9,
+            'eq_sub30_gain': 6.0, 'eq_sub60_gain': 7.5, 'eq_bass100_gain': 5.0,
+            'eq_lowmid350_gain': -3.5, 'eq_mid700_gain': -1.5,
+            'eq_presence3k_gain': 3.0, 'eq_bril8k_gain': 3.5, 'eq_air12k_gain': 4.5,
+            'enable_vocal_center': False, 'instrument_enhance': True,
+            'intensity_multiplier': 1.15, 'hrtf_intensity': 1.1,
+        },
+        'house': {
+            'name': 'House Groove',
+            'rotation_speed': 0.18, 'bass_rotation': 0.08, 'treble_rotation': 0.30,
+            'reverb_room': 0.70, 'reverb_mix': 0.32, 'reverb_density': 0.80,
+            'stereo_width': 1.25, 'elevation': 0.0, 'distance': 1.0,
+            'eq_sub30_gain': 7.0, 'eq_sub60_gain': 8.0, 'eq_bass100_gain': 5.5,
+            'eq_lowmid350_gain': -2.5, 'eq_mid700_gain': -0.5,
+            'eq_presence3k_gain': 2.5, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 4.0,
+            'enable_vocal_center': False, 'instrument_enhance': True,
+            'intensity_multiplier': 1.1, 'hrtf_intensity': 1.0,
+        },
+        'trance': {
+            'name': 'Trance Atmosphere',
+            'rotation_speed': 0.16, 'bass_rotation': 0.07, 'treble_rotation': 0.28,
+            'reverb_room': 0.85, 'reverb_mix': 0.45, 'reverb_density': 0.90,
+            'stereo_width': 1.45, 'elevation': 0.12, 'distance': 1.2,
+            'eq_sub30_gain': 5.0, 'eq_sub60_gain': 6.5, 'eq_bass100_gain': 4.5,
+            'eq_lowmid350_gain': -2.0, 'eq_mid700_gain': 0.0,
+            'eq_presence3k_gain': 3.5, 'eq_bril8k_gain': 4.0, 'eq_air12k_gain': 5.5,
+            'enable_vocal_center': False, 'instrument_enhance': True,
+            'intensity_multiplier': 1.05, 'hrtf_intensity': 1.2,
+        },
+        # ── Rock / Metal ──────────────────────────────────────────────────────
+        'rock': {
+            'name': 'Rock Arena',
+            'rotation_speed': 0.19, 'bass_rotation': 0.11, 'treble_rotation': 0.32,
+            'reverb_room': 0.55, 'reverb_mix': 0.30, 'reverb_density': 0.70,
+            'stereo_width': 1.20, 'elevation': 0.0, 'distance': 1.0,
+            'eq_sub30_gain': 4.0, 'eq_sub60_gain': 5.0, 'eq_bass100_gain': 5.5,
+            'eq_lowmid350_gain': -3.5, 'eq_mid700_gain': -2.0,
+            'eq_presence3k_gain': 4.5, 'eq_def5k_gain': 3.5, 'eq_bril8k_gain': 3.0,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.1, 'hrtf_intensity': 1.0,
+        },
+        'metal': {
+            'name': 'Metal Intensity',
+            'rotation_speed': 0.24, 'bass_rotation': 0.13, 'treble_rotation': 0.40,
+            'reverb_room': 0.45, 'reverb_mix': 0.25, 'reverb_density': 0.65,
+            'stereo_width': 1.30, 'elevation': -0.05, 'distance': 0.95,
+            'eq_sub30_gain': 5.5, 'eq_sub60_gain': 6.0, 'eq_bass100_gain': 4.5,
+            'eq_lowmid350_gain': -5.0, 'eq_mid700_gain': -3.5,
+            'eq_presence3k_gain': 6.0, 'eq_def5k_gain': 4.5, 'eq_bril8k_gain': 3.5,
+            'enable_vocal_center': True, 'instrument_enhance': False,
+            'intensity_multiplier': 1.2, 'hrtf_intensity': 1.1,
+        },
+        'indie': {
+            'name': 'Indie Intimate',
+            'rotation_speed': 0.14, 'bass_rotation': 0.07, 'treble_rotation': 0.22,
+            'reverb_room': 0.68, 'reverb_mix': 0.38, 'reverb_density': 0.75,
+            'stereo_width': 1.10, 'elevation': 0.05, 'distance': 1.1,
+            'eq_sub30_gain': 2.5, 'eq_sub60_gain': 3.5, 'eq_bass100_gain': 4.0,
+            'eq_lowmid350_gain': -1.5, 'eq_mid700_gain': 0.5,
+            'eq_presence3k_gain': 2.5, 'eq_bril8k_gain': 2.5, 'eq_air12k_gain': 3.0,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.0, 'hrtf_intensity': 0.95,
+        },
+        # ── Hip-Hop / R&B ─────────────────────────────────────────────────────
+        'hip_hop': {
+            'name': 'Hip-Hop Bass',
+            'rotation_speed': 0.13, 'bass_rotation': 0.06, 'treble_rotation': 0.20,
+            'reverb_room': 0.50, 'reverb_mix': 0.25, 'reverb_density': 0.65,
+            'stereo_width': 1.15, 'elevation': -0.08, 'distance': 0.85,
+            'eq_sub30_gain': 8.5, 'eq_sub60_gain': 9.5, 'eq_bass100_gain': 6.5,
+            'eq_lowmid350_gain': -4.5, 'eq_mid700_gain': -2.5,
+            'eq_presence3k_gain': 2.0, 'eq_bril8k_gain': 2.0, 'eq_air12k_gain': 2.5,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.05, 'hrtf_intensity': 0.9,
+        },
+        'trap': {
+            'name': 'Trap Spatial',
+            'rotation_speed': 0.15, 'bass_rotation': 0.07, 'treble_rotation': 0.25,
+            'reverb_room': 0.60, 'reverb_mix': 0.30, 'reverb_density': 0.70,
+            'stereo_width': 1.25, 'elevation': 0.0, 'distance': 0.9,
+            'eq_sub30_gain': 9.0, 'eq_sub60_gain': 10.0, 'eq_bass100_gain': 6.0,
+            'eq_lowmid350_gain': -4.0, 'eq_mid700_gain': -2.0,
+            'eq_presence3k_gain': 2.5, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 3.5,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.1, 'hrtf_intensity': 1.0,
+        },
+        'rnb': {
+            'name': 'R&B Smooth',
+            'rotation_speed': 0.14, 'bass_rotation': 0.07, 'treble_rotation': 0.22,
+            'reverb_room': 0.72, 'reverb_mix': 0.40, 'reverb_density': 0.80,
+            'stereo_width': 1.15, 'elevation': 0.05, 'distance': 1.1,
+            'eq_sub30_gain': 5.0, 'eq_sub60_gain': 6.0, 'eq_bass100_gain': 5.0,
+            'eq_lowmid350_gain': -2.0, 'eq_mid700_gain': 0.0,
+            'eq_presence3k_gain': 3.0, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 4.0,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.0, 'hrtf_intensity': 0.95,
+        },
+        # ── Classical / Acoustic ──────────────────────────────────────────────
+        'classical': {
+            'name': 'Classical Hall',
+            'rotation_speed': 0.10, 'bass_rotation': 0.05, 'treble_rotation': 0.16,
+            'reverb_room': 0.90, 'reverb_mix': 0.55, 'reverb_density': 0.92,
+            'stereo_width': 1.35, 'elevation': 0.15, 'distance': 1.4,
+            'eq_sub30_gain': 1.0, 'eq_sub60_gain': 1.5, 'eq_bass100_gain': 2.0,
+            'eq_lowmid350_gain': -1.0, 'eq_mid700_gain': 0.5,
+            'eq_presence3k_gain': 3.5, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 4.0,
+            'enable_vocal_center': False, 'instrument_enhance': False,
+            'intensity_multiplier': 0.95, 'hrtf_intensity': 1.15,
+        },
+        'orchestral': {
+            'name': 'Orchestral Wide',
+            'rotation_speed': 0.11, 'bass_rotation': 0.05, 'treble_rotation': 0.18,
+            'reverb_room': 0.88, 'reverb_mix': 0.50, 'reverb_density': 0.90,
+            'stereo_width': 1.40, 'elevation': 0.12, 'distance': 1.3,
+            'eq_sub30_gain': 1.5, 'eq_sub60_gain': 2.0, 'eq_bass100_gain': 2.5,
+            'eq_lowmid350_gain': -1.5, 'eq_mid700_gain': 0.0,
+            'eq_presence3k_gain': 3.0, 'eq_bril8k_gain': 3.5, 'eq_air12k_gain': 4.5,
+            'enable_vocal_center': False, 'instrument_enhance': False,
+            'intensity_multiplier': 1.0, 'hrtf_intensity': 1.2,
+        },
+        'acoustic': {
+            'name': 'Acoustic Natural',
+            'rotation_speed': 0.12, 'bass_rotation': 0.06, 'treble_rotation': 0.19,
+            'reverb_room': 0.75, 'reverb_mix': 0.42, 'reverb_density': 0.78,
+            'stereo_width': 1.15, 'elevation': 0.08, 'distance': 1.2,
+            'eq_sub30_gain': 2.0, 'eq_sub60_gain': 3.0, 'eq_bass100_gain': 3.5,
+            'eq_lowmid350_gain': -1.5, 'eq_mid700_gain': 0.5,
+            'eq_presence3k_gain': 2.5, 'eq_bril8k_gain': 2.5, 'eq_air12k_gain': 3.5,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.0, 'hrtf_intensity': 1.0,
+        },
+        # ── Jazz / Blues ──────────────────────────────────────────────────────
+        'jazz': {
+            'name': 'Jazz Club',
+            'rotation_speed': 0.15, 'bass_rotation': 0.07, 'treble_rotation': 0.24,
+            'reverb_room': 0.70, 'reverb_mix': 0.40, 'reverb_density': 0.75,
+            'stereo_width': 1.15, 'elevation': 0.0, 'distance': 1.0,
+            'eq_sub30_gain': 2.5, 'eq_sub60_gain': 3.5, 'eq_bass100_gain': 3.0,
+            'eq_lowmid350_gain': -1.5, 'eq_mid700_gain': 0.0,
+            'eq_presence3k_gain': 2.5, 'eq_bril8k_gain': 2.5, 'eq_air12k_gain': 3.0,
+            'enable_vocal_center': False, 'instrument_enhance': True,
+            'intensity_multiplier': 1.0, 'hrtf_intensity': 1.0,
+        },
+        'blues': {
+            'name': 'Blues Soul',
+            'rotation_speed': 0.13, 'bass_rotation': 0.06, 'treble_rotation': 0.21,
+            'reverb_room': 0.65, 'reverb_mix': 0.35, 'reverb_density': 0.70,
+            'stereo_width': 1.10, 'elevation': 0.0, 'distance': 1.0,
+            'eq_sub30_gain': 3.5, 'eq_sub60_gain': 4.5, 'eq_bass100_gain': 4.0,
+            'eq_lowmid350_gain': -2.0, 'eq_mid700_gain': -0.5,
+            'eq_presence3k_gain': 3.0, 'eq_bril8k_gain': 2.5, 'eq_air12k_gain': 3.0,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.0, 'hrtf_intensity': 0.95,
+        },
+        # ── Pop / Vocal ───────────────────────────────────────────────────────
+        'pop': {
+            'name': 'Pop Polish',
+            'rotation_speed': 0.17, 'bass_rotation': 0.08, 'treble_rotation': 0.28,
+            'reverb_room': 0.62, 'reverb_mix': 0.32, 'reverb_density': 0.72,
+            'stereo_width': 1.20, 'elevation': 0.0, 'distance': 1.0,
+            'eq_sub30_gain': 4.5, 'eq_sub60_gain': 5.5, 'eq_bass100_gain': 4.5,
+            'eq_lowmid350_gain': -2.5, 'eq_mid700_gain': -0.5,
+            'eq_presence3k_gain': 3.5, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 4.0,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.05, 'hrtf_intensity': 1.0,
+        },
+        'ballad': {
+            'name': 'Ballad Emotion',
+            'rotation_speed': 0.11, 'bass_rotation': 0.05, 'treble_rotation': 0.18,
+            'reverb_room': 0.78, 'reverb_mix': 0.45, 'reverb_density': 0.82,
+            'stereo_width': 1.10, 'elevation': 0.08, 'distance': 1.2,
+            'eq_sub30_gain': 3.0, 'eq_sub60_gain': 4.0, 'eq_bass100_gain': 4.0,
+            'eq_lowmid350_gain': -1.5, 'eq_mid700_gain': 0.5,
+            'eq_presence3k_gain': 3.0, 'eq_bril8k_gain': 2.5, 'eq_air12k_gain': 3.5,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 0.95, 'hrtf_intensity': 0.95,
+        },
+        # ── Ambient / Chill ───────────────────────────────────────────────────
+        'ambient': {
+            'name': 'Ambient Drift',
+            'rotation_speed': 0.07, 'bass_rotation': 0.03, 'treble_rotation': 0.11,
+            'reverb_room': 0.95, 'reverb_mix': 0.65, 'reverb_density': 0.95,
+            'stereo_width': 1.50, 'elevation': 0.18, 'distance': 1.6,
+            'eq_sub30_gain': 1.5, 'eq_sub60_gain': 2.5, 'eq_bass100_gain': 2.0,
+            'eq_lowmid350_gain': -1.0, 'eq_mid700_gain': 0.0,
+            'eq_presence3k_gain': 2.0, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 5.5,
+            'enable_vocal_center': False, 'instrument_enhance': False,
+            'intensity_multiplier': 0.9, 'hrtf_intensity': 1.25,
+        },
+        'lofi': {
+            'name': 'Lo-Fi Chill',
+            'rotation_speed': 0.09, 'bass_rotation': 0.04, 'treble_rotation': 0.14,
+            'reverb_room': 0.72, 'reverb_mix': 0.38, 'reverb_density': 0.70,
+            'stereo_width': 1.20, 'elevation': 0.0, 'distance': 1.1,
+            'eq_sub30_gain': 3.0, 'eq_sub60_gain': 4.0, 'eq_bass100_gain': 3.5,
+            'eq_lowmid350_gain': -1.5, 'eq_mid700_gain': -0.5,
+            'eq_presence3k_gain': 1.5, 'eq_bril8k_gain': 1.5, 'eq_air12k_gain': 2.0,
+            'enable_vocal_center': False, 'instrument_enhance': False,
+            'intensity_multiplier': 0.95, 'hrtf_intensity': 0.9,
+        },
+        # ── South Asian ───────────────────────────────────────────────────────
+        'bollywood': {
+            'name': 'Bollywood Grand',
+            'rotation_speed': 0.15, 'bass_rotation': 0.07, 'treble_rotation': 0.24,
+            'reverb_room': 0.72, 'reverb_mix': 0.40, 'reverb_density': 0.78,
+            'stereo_width': 1.20, 'elevation': 0.05, 'distance': 1.1,
+            'eq_sub30_gain': 4.0, 'eq_sub60_gain': 5.5, 'eq_bass100_gain': 4.5,
+            'eq_lowmid350_gain': -2.0, 'eq_mid700_gain': 0.5,
+            'eq_presence3k_gain': 4.0, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 3.5,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.05, 'hrtf_intensity': 1.0,
+        },
+        'bhangra': {
+            'name': 'Bhangra Energy',
+            'rotation_speed': 0.21, 'bass_rotation': 0.12, 'treble_rotation': 0.32,
+            'reverb_room': 0.58, 'reverb_mix': 0.30, 'reverb_density': 0.72,
+            'stereo_width': 1.28, 'elevation': 0.0, 'distance': 0.95,
+            'eq_sub30_gain': 6.0, 'eq_sub60_gain': 7.5, 'eq_bass100_gain': 6.0,
+            'eq_lowmid350_gain': -3.5, 'eq_mid700_gain': -1.0,
+            'eq_presence3k_gain': 4.5, 'eq_bril8k_gain': 4.0, 'eq_air12k_gain': 4.0,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 1.15, 'hrtf_intensity': 1.05,
+        },
+        'indian_classical': {
+            'name': 'Indian Classical',
+            'rotation_speed': 0.10, 'bass_rotation': 0.05, 'treble_rotation': 0.16,
+            'reverb_room': 0.85, 'reverb_mix': 0.52, 'reverb_density': 0.88,
+            'stereo_width': 1.15, 'elevation': 0.12, 'distance': 1.3,
+            'eq_sub30_gain': 1.5, 'eq_sub60_gain': 2.5, 'eq_bass100_gain': 3.0,
+            'eq_lowmid350_gain': -1.0, 'eq_mid700_gain': 1.0,
+            'eq_presence3k_gain': 3.5, 'eq_bril8k_gain': 3.0, 'eq_air12k_gain': 4.0,
+            'enable_vocal_center': True, 'instrument_enhance': True,
+            'intensity_multiplier': 0.95, 'hrtf_intensity': 1.15,
+        },
+    }
+
+    @staticmethod
+    def select_preset(
+        analysis: Dict[str, Any],
+        user_genre: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Auto-select optimal preset from analysis. Returns preset dict."""
+        gp = PresetLibrary.GENRE_PRESETS
+
+        # 1. Explicit genre override
+        if user_genre and user_genre in gp:
+            print(f"  ↳ Auto-preset: user genre '{user_genre}'")
+            return gp[user_genre].copy()
+
+        # 2. Detected genre
+        genre = analysis.get('genre', 'unknown')
+        selected = gp.get(genre, gp['pop']).copy()
+        print(f"  ↳ Auto-preset: detected '{genre}' → '{selected['name']}'")
+
+        # 3. Tempo-based rotation tweak
+        bpm = analysis.get('bpm', 120)
+        if bpm < 90:
+            selected['rotation_speed'] = min(selected.get('rotation_speed', 0.15) * 0.85, 0.15)
+            selected['bass_rotation']  = min(selected.get('bass_rotation', 0.08) * 0.85, 0.08)
+            print(f"  ↳ Auto-adjust: slow tempo ({bpm} BPM)")
+        elif bpm > 140:
+            selected['rotation_speed']   = min(selected.get('rotation_speed', 0.15) * 1.15, 0.30)
+            selected['treble_rotation']  = min(selected.get('treble_rotation', 0.20) * 1.15, 0.45)
+            print(f"  ↳ Auto-adjust: fast tempo ({bpm} BPM)")
+
+        # 4. Vocal protection
+        if analysis.get('has_vocals') and analysis.get('vocal_prominence', 0) > 0.6:
+            selected['enable_vocal_center'] = True
+            selected['vocal_safe_bass']     = True
+            selected['eq_mid700_gain']      = max(selected.get('eq_mid700_gain', -0.5), -0.5)
+            print("  ↳ Auto-adjust: strong vocals → vocal protection enabled")
+
+        # 5. Dynamic range
+        crest = analysis.get('crest_factor_db', 12)
+        if crest < 6:
+            selected['intensity_multiplier'] = selected.get('intensity_multiplier', 1.0) * 1.1
+            print(f"  ↳ Auto-adjust: over-compressed ({crest}dB)")
+        elif crest > 18:
+            selected['reverb_mix'] = min(selected.get('reverb_mix', 0.3) * 1.1, 0.55)
+            print(f"  ↳ Auto-adjust: very dynamic ({crest}dB)")
+
+        # 6. Spectral balance: bass-heavy
+        sub  = analysis.get('sub_bass_ratio', 0) + analysis.get('upper_sub_ratio', 0)
+        bass = analysis.get('bass_ratio', 0)     + analysis.get('upper_bass_ratio', 0)
+        if sub + bass > 0.45:
+            selected['eq_sub30_gain']  = min(selected.get('eq_sub30_gain', 7.0) + 1.0, 10.0)
+            selected['eq_sub60_gain']  = min(selected.get('eq_sub60_gain', 8.0) + 1.0, 11.0)
+            print("  ↳ Auto-adjust: bass-heavy mix")
+
+        # 7. Fake stereo widening
+        if analysis.get('is_fake_stereo'):
+            selected['stereo_width'] = min(selected.get('stereo_width', 1.0) * 1.25, 1.6)
+            print("  ↳ Auto-adjust: fake stereo widening")
+
+        return selected
+
+    @staticmethod
+    def get_preset_list() -> List[Dict[str, str]]:
+        """Return list of presets for the frontend dropdown."""
+        CATEGORY_LABEL = {
+            'electronic': 'Electronic', 'house': 'Electronic', 'trance': 'Electronic',
+            'rock': 'Rock', 'metal': 'Rock', 'indie': 'Rock',
+            'hip_hop': 'Hip-Hop', 'trap': 'Hip-Hop', 'rnb': 'Hip-Hop',
+            'classical': 'Classical', 'orchestral': 'Classical', 'acoustic': 'Classical',
+            'jazz': 'Jazz', 'blues': 'Jazz',
+            'pop': 'Pop', 'ballad': 'Pop',
+            'ambient': 'Ambient', 'lofi': 'Ambient',
+            'bollywood': 'South Asian', 'bhangra': 'South Asian', 'indian_classical': 'South Asian',
+        }
+        out = [{'id': 'auto', 'name': '\U0001f916 Auto-Detect', 'category': 'auto',
+                'description': 'Analyze audio and select optimal preset automatically'}]
+        for key, preset in PresetLibrary.GENRE_PRESETS.items():
+            out.append({
+                'id': key,
+                'name': preset['name'],
+                'category': CATEGORY_LABEL.get(key, 'Other'),
+                'description': f"Optimised for {key.replace('_', ' ')} music",
+            })
+        return out
+
+# ============================================================================
+# TTL EVICTION — background sweeper for stem sessions and batch jobs
+# ============================================================================
+#
+# stem_sessions and batch_queue previously grew indefinitely — every track
+# processed accumulates orphaned WAV stems on disk and stale queue entries
+# in memory.  This sweeper runs every 10 minutes and evicts entries older
+# than TTL_HOURS (default 2 hours), unlinking associated files.
+
+TTL_HOURS  = 2
+TTL_SECS   = TTL_HOURS * 3600
+
+async def _ttl_sweeper():
+    """Background coroutine: sweeps stem_sessions and batch_queue every 10 min."""
+    import time
+    while True:
+        await asyncio.sleep(600)   # run every 10 minutes
+        now = time.time()
+        cutoff = now - TTL_SECS
+
+        # ── Stem sessions ────────────────────────────────────────────────────
+        expired_sessions = [
+            sid for sid, ts in _session_timestamps.items()
+            if ts < cutoff and sid in stem_sessions
+        ]
+        for sid in expired_sessions:
+            stems = stem_sessions.pop(sid, {})
+            for stem_path in stems.values():
+                try:
+                    p = Path(stem_path)
+                    if p.exists():
+                        p.unlink()
+                    # Also remove the parent temp dir if empty
+                    parent = p.parent
+                    if parent.exists() and not any(parent.iterdir()):
+                        parent.rmdir()
+                except Exception:
+                    pass
+            _session_timestamps.pop(sid, None)
+            print(f"  🗑  TTL evicted stem session {sid[:8]}… ({len(stems)} files)")
+
+        # ── Batch jobs ───────────────────────────────────────────────────────
+        expired_batches = [
+            bid for bid, ts in _session_timestamps.items()
+            if ts < cutoff and bid in batch_queue
+        ]
+        for bid in expired_batches:
+            batch_queue.pop(bid, None)
+            _session_timestamps.pop(bid, None)
+            print(f"  🗑  TTL evicted batch queue {bid[:8]}…")
+
+@app.on_event("startup")
+async def startup_event():
+    """Register background tasks on application startup."""
+    asyncio.create_task(_ttl_sweeper())
 
 
 # ============================================================================
@@ -1109,6 +1539,698 @@ instrument_router = InstrumentRouter()
 
 
 # ============================================================================
+# HRIR CONVOLUTION ENGINE  — v9.0  (breaks the FFmpeg filtergraph ceiling)
+# ============================================================================
+#
+# All previous HRTF simulation was done inside FFmpeg's volume + equalizer
+# filters. That architecture has a hard ceiling:
+#   • ILD via volume automation — accurate only for a spherical head model
+#   • ITD via static adelay — fixed integer-sample delays, no interp
+#   • Pinna notches via 4 EQ bells — real pinna HRIRs have 200–300 ms
+#     impulse responses with complex spectral structure impossible to model
+#     with parametric EQ
+#
+# This engine:
+#   1. Loads audio into NumPy (librosa)
+#   2. For each 256-sample block, looks up the binaural HRIR for the current
+#      rotation angle (beat-locked if beats available)
+#   3. Convolves each block via OLA (overlap-add) with scipy.signal.fftconvolve
+#   4. Outputs a float32 stereo WAV that FFmpeg ingests for reverb + EQ + encode
+#
+# HRIR source: synthesized from first principles using:
+#   • Woodworth ITD model (head radius r=0.0875 m, c=343 m/s)
+#   • Spherical head ILD model (Duda & Martens 1998)
+#   • Pinna notch resonances: 4-notch comb at 8, 10.5, 13, 16 kHz
+#   • Optional: load real KEMAR compact-pinnae dataset (.npy format)
+#     Drop a file named "kemar_hrirs.npy" next to backend.py with shape
+#     (36, 2, N) — 36 azimuths (0–350° step 10°), L/R channels, N samples.
+
+class HRIREngine:
+    """
+    Block-based binaural renderer using Head-Related Impulse Responses.
+
+    v10.1 — Full SOFA support (KEMAR near-field dataset):
+        • Loads any *.sofa HDF5 file directly — no conversion step needed.
+        • Builds a 3-D lookup table: (distance_cm, elevation_deg, azimuth_deg)
+        • Trilinear interpolation across all three spatial dimensions.
+        • Distance range : 20–110 cm  (dataset 1 cm steps; engine samples ~11)
+        • Elevation range: −25° → +35° (full KEMAR measurement range)
+        • Azimuth range  : 0° → 360°  (full circle, per-measurement interp)
+        • Falls back to legacy .npy then synthetic if SOFA unavailable.
+
+    Usage:
+        engine = HRIREngine(sample_rate=48000)
+        stereo = engine.render(
+            mono,           # np.ndarray (N,) float32
+            beat_times_s,   # List[float] | None
+            rotation_speed, # Hz
+            elevation,      # normalised [-1, 1]
+            distance_m,     # metres  (0.20 – 1.10 maps into SOFA range)
+        )
+        # stereo shape: (2, N)
+    """
+
+    BLOCK  = 256    # OLA processing block size (samples)
+    HRIR_N = 512    # Target IR length after resampling / truncation
+    # Legacy constants — still used when falling back to numpy / synthetic
+    AZ_STEP = 10
+    N_AZ    = 36
+
+    def __init__(self, sample_rate: int = 48000):
+        self.sr         = sample_rate
+        self.using_sofa = False
+
+        # ── SOFA 3-D lookup ───────────────────────────────────────────────────
+        # sofa_table[dist_cm][elev_deg] = (az_arr, L_mat, R_mat)
+        #   az_arr : float32 (N_az,)         sorted azimuths in degrees
+        #   L_mat  : float32 (N_az, HRIR_N)  left  HRIR for each azimuth
+        #   R_mat  : float32 (N_az, HRIR_N)  right HRIR for each azimuth
+        self.sofa_table : Dict[int, Dict[int, tuple]] = {}
+        self.sofa_dists : List[int] = []   # sorted unique loaded distances (cm)
+        self.sofa_elevs : List[int] = []   # sorted unique elevations (deg)
+
+        # ── Legacy flat lookup (numpy / synthetic) ────────────────────────────
+        # hrirs[az_idx] = (L_ir, R_ir)  both shape (HRIR_N,)
+        self.hrirs: Dict[int, tuple] = {}
+
+        self._load()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Loading — SOFA → numpy → synthetic cascade
+
+    def _load(self):
+        # 1. Try ALL *.sofa files in BASE_DIR — merge every file found so that
+        #    e.g. KEMAR_NFHRIRmea_1cm + _1.5cm combine into one richer table.
+        sofa_candidates = sorted(
+            list(BASE_DIR.glob("*.sofa")) + list(BASE_DIR.glob("*.SOFA")),
+            key=lambda p: (0 if "mea" in p.name.lower() else 1)
+        )
+        if sofa_candidates:
+            loaded_any = False
+            for sofa_path in sofa_candidates:
+                try:
+                    self._load_sofa(sofa_path, merge=loaded_any)
+                    loaded_any = True
+                    n_dists = len(getattr(self, "sofa_dists", []))
+                    print(f"  ↳ Merged {sofa_path.name} (table: {n_dists} distances)")
+                except Exception as e:
+                    print(f"⚠  HRIR: {sofa_path.name} failed ({e}), skipping")
+            if loaded_any:
+                return
+
+        # 2. Legacy numpy  (36 × 2 × N  or  36 × N × 2)
+        kemar_path = BASE_DIR / "kemar_hrirs.npy"
+        if kemar_path.exists():
+            try:
+                data = np.load(str(kemar_path))
+                if data.ndim == 3:
+                    n = data.shape[0]
+                    for i in range(n):
+                        if data.shape[1] == 2:
+                            self.hrirs[i] = (data[i, 0].astype(np.float32),
+                                             data[i, 1].astype(np.float32))
+                        else:
+                            self.hrirs[i] = (data[i, :, 0].astype(np.float32),
+                                             data[i, :, 1].astype(np.float32))
+                    self.AZ_STEP = 360 // n
+                    self.N_AZ    = n
+                    print(f"✅ HRIR: Loaded numpy dataset ({n} azimuths)")
+                    return
+            except Exception as e:
+                print(f"⚠  HRIR: numpy load failed ({e})")
+
+        # 3. Synthetic model
+        self._build_synthetic()
+        print(f"✅ HRIR: Synthetic model built ({self.N_AZ} azimuths @ {self.sr} Hz)")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SOFA loader
+
+    def _load_sofa(self, path: Path, merge: bool = False):
+        """
+        Load a SOFA (HDF5) HRTF dataset and build (or extend) the 3-D lookup table.
+
+        merge=False: replaces any existing table (first file).
+        merge=True:  adds this file's distances to the existing table so that
+                     multiple SOFA files (e.g. near-field at different distances)
+                     are combined into one richer lookup.
+
+        Coordinate convention assumed:
+          SourcePosition[:, 0] = azimuth  (degrees, 0=front, 90=right)
+          SourcePosition[:, 1] = elevation (degrees)
+          SourcePosition[:, 2] = distance  (metres — SOFA standard)
+        """
+        if not H5PY_AVAILABLE:
+            raise RuntimeError("h5py not installed — pip install h5py")
+        try:
+            import h5py
+        except ImportError:
+            raise RuntimeError("h5py required for SOFA — pip install h5py")
+        try:
+            from scipy.signal import resample_poly
+        except ImportError:
+            raise RuntimeError("scipy required for SOFA — pip install scipy")
+        from math import gcd
+
+        print(f"  ⟳ HRIR: Loading {path.name} …")
+
+        with h5py.File(str(path), 'r') as f:
+            ir_data   = f['Data.IR'][:]            # (M, R, N_orig)
+            positions = f['SourcePosition'][:]      # (M, 3)
+            sr_sofa   = int(np.squeeze(f['Data.SamplingRate'][:]))
+
+        M, R, N_orig = ir_data.shape
+        print(f"  ↳ {M:,} measurements  SR={sr_sofa} Hz  IR={N_orig} smp  "
+              f"receivers={R}")
+
+        # ── Coordinate parse ─────────────────────────────────────────────────
+        az_raw   = positions[:, 0] % 360.0
+        elev_raw = positions[:, 1]
+        dist_raw = positions[:, 2]
+
+        # Convert to cm (SOFA stores metres; guard against files already in cm)
+        dist_cm_f = dist_raw * 100.0 if dist_raw.max() < 5.0 else dist_raw.copy()
+
+        # ── Resampling setup ─────────────────────────────────────────────────
+        needs_resample = (sr_sofa != self.sr)
+        if needs_resample:
+            g    = gcd(self.sr, sr_sofa)
+            up   = self.sr   // g
+            down = sr_sofa   // g
+            n_rs = int(np.ceil(N_orig * up / down))
+            print(f"  ↳ Resampling {sr_sofa}→{self.sr} Hz  (×{up}/÷{down})")
+        else:
+            up = down = 1
+            n_rs = N_orig
+
+        target_n = min(self.HRIR_N, n_rs)
+
+        # ── Choose subset of distances to load ───────────────────────────────
+        all_dist_cm = np.unique(np.round(dist_cm_f).astype(int))
+        n_dists     = len(all_dist_cm)
+        if n_dists > 1:
+            # Sample ~11 distances evenly (always include endpoints)
+            n_load = min(11, n_dists)
+            idx    = np.round(np.linspace(0, n_dists - 1, n_load)).astype(int)
+            load_set = set(all_dist_cm[np.unique(idx)].tolist())
+        else:
+            load_set = set(all_dist_cm.tolist())
+
+        # ── Quantise elevation + azimuth to dataset grid ─────────────────────
+        # Round elevation to nearest 5°  (KEMAR dataset is at 5° steps)
+        # Round azimuth   to nearest 5°
+        elev_q = (np.round(elev_raw / 5.0) * 5.0).astype(int)
+        az_q   = (np.round(az_raw   / 5.0) * 5.0 % 360).astype(int)
+        dist_q =  np.round(dist_cm_f).astype(int)
+
+        unique_elevs = sorted(set(elev_q.tolist()))
+        print(f"  ↳ Elevations: {unique_elevs[0]}° → {unique_elevs[-1]}°  "
+              f"({len(unique_elevs)} levels)")
+        print(f"  ↳ Loading {len(load_set)}/{n_dists} distances  "
+              f"({min(load_set)}–{max(load_set)} cm) …")
+
+        table: Dict[int, Dict[int, tuple]] = {}
+        n_irs_loaded = 0
+
+        for d_cm in sorted(load_set):
+            table[d_cm] = {}
+            for e_deg in unique_elevs:
+                mask    = (dist_q == d_cm) & (elev_q == e_deg)
+                indices = np.where(mask)[0]
+                if len(indices) == 0:
+                    continue
+
+                az_vals = az_q[indices]
+                order   = np.argsort(az_vals)
+                az_sorted    = az_vals[order].astype(np.float32)
+                meas_sorted  = indices[order]
+
+                L_list: List[np.ndarray] = []
+                R_list: List[np.ndarray] = []
+
+                for m_idx in meas_sorted:
+                    # Use only the first two receivers (L=0, R=1)
+                    ir_L = ir_data[m_idx, 0].astype(np.float64)
+                    ir_R = ir_data[m_idx, 1].astype(np.float64)
+
+                    if needs_resample:
+                        ir_L = resample_poly(ir_L, up, down)
+                        ir_R = resample_poly(ir_R, up, down)
+
+                    # Truncate / zero-pad to target_n
+                    L_t = np.zeros(target_n, dtype=np.float32)
+                    R_t = np.zeros(target_n, dtype=np.float32)
+                    cn  = min(target_n, len(ir_L))
+                    L_t[:cn] = ir_L[:cn].astype(np.float32)
+                    R_t[:cn] = ir_R[:cn].astype(np.float32)
+
+                    L_list.append(L_t)
+                    R_list.append(R_t)
+                    n_irs_loaded += 1
+
+                table[d_cm][e_deg] = (
+                    az_sorted,
+                    np.stack(L_list),   # (N_az, target_n)
+                    np.stack(R_list),
+                )
+
+        if merge and hasattr(self, 'sofa_table') and self.sofa_table:
+            # Merge new distances into existing table; don't overwrite existing ones
+            for d_cm_new, e_dict in table.items():
+                if d_cm_new not in self.sofa_table:
+                    self.sofa_table[d_cm_new] = e_dict
+                else:
+                    # Distance already present — merge elevation slots
+                    for e_deg, slot in e_dict.items():
+                        if e_deg not in self.sofa_table[d_cm_new]:
+                            self.sofa_table[d_cm_new][e_deg] = slot
+            self.sofa_dists = sorted(self.sofa_table.keys())
+            # Keep elevation list as union of both
+            merged_elevs = sorted(set(self.sofa_elevs) | set(unique_elevs))
+            self.sofa_elevs = merged_elevs
+        else:
+            self.sofa_table  = table
+            self.sofa_dists  = sorted(table.keys())
+            self.sofa_elevs  = unique_elevs
+        self.HRIR_N      = target_n
+        self.using_sofa  = True
+
+        mem_mb = n_irs_loaded * 2 * target_n * 4 / 1024**2
+        print(f"✅ HRIR: SOFA loaded — {n_irs_loaded:,} IRs  "
+              f"({len(self.sofa_dists)} dists × {len(unique_elevs)} elevs)  "
+              f"IR={target_n} taps @ {self.sr} Hz  ≈{mem_mb:.0f} MB")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Synthetic HRIR generation
+
+    def _build_synthetic(self):
+        for az_idx in range(self.N_AZ):
+            az_deg = az_idx * self.AZ_STEP
+            L, R = self._synthesize_hrir(az_deg)
+            self.hrirs[az_idx] = (L, R)
+
+    def _synthesize_hrir(self, az_deg: float) -> tuple:
+        """
+        Synthesise a binaural HRIR pair using three perceptual cues:
+
+        1. ITD (Woodworth 1962): delay = (r/c) * (θ + sin θ)
+           where r = 0.0875 m (head radius), c = 343 m/s.
+           Maps az ∈ [0°, 180°] → ITD ∈ [0, 630 μs].
+
+        2. ILD (Duda & Martens 1998 approximation):
+           HF attenuation on the contralateral channel using a 1st-order
+           shelf model.  At 90° the far-ear is attenuated ~7 dB above 1 kHz.
+
+        3. Pinna spectral notches:
+           Narrow EQ cuts at 8, 10.5, 13, 16 kHz applied to the contralateral
+           channel, simulating pinna reflection-induced cancellation peaks.
+        """
+        sr   = self.sr
+        N    = self.HRIR_N
+        r    = 0.0875           # head radius, metres
+        c    = 343.0            # speed of sound, m/s
+
+        # Map azimuth to angle in [0, π] (left=π, right=0)
+        # Convention: 0° = front, 90° = right, 180°/270° = left
+        az_rad = np.radians(az_deg % 360)
+        # Lateral angle: 0 at front/back, π/2 at 90° right
+        lateral = abs(np.sin(az_rad))            # 0..1
+
+        # ── 1. ITD ──────────────────────────────────────────────────────────
+        itd_s = (r / c) * (az_rad + np.sin(az_rad))  # Woodworth
+        if az_deg > 180:
+            itd_s = -itd_s   # flip for left side
+        itd_samples = int(round(itd_s * sr))
+        itd_samples = max(-N // 4, min(N // 4, itd_samples))  # clamp
+
+        # ── 2. Base impulse (Dirac) ──────────────────────────────────────────
+        L_ir = np.zeros(N, dtype=np.float32)
+        R_ir = np.zeros(N, dtype=np.float32)
+
+        # Leading ear: onset at sample 4 for pre-ringing headroom
+        onset = 4
+        if itd_samples >= 0:
+            # Source to the right: R leads
+            R_ir[onset]                = 1.0
+            L_ir[onset + itd_samples] = 1.0
+        else:
+            # Source to the left: L leads
+            L_ir[onset]                = 1.0
+            R_ir[onset - itd_samples] = 1.0
+
+        # ── 3. ILD — frequency-dependent shelf on contralateral channel ──────
+        # Approximate using a minimum-phase shelf filter.
+        # 7 dB attenuation above 1 kHz, scaled by lateral position.
+        ild_db = -7.0 * lateral
+        ild_lin = 10.0 ** (ild_db / 20.0)
+
+        # Build a very gentle 1-pole high-shelf coefficient
+        # y[n] = x[n] + alpha * (x[n] - x[n-1])  — enhances ILD at HF
+        alpha = 0.0  # start flat
+        if abs(ild_db) > 0.5:
+            # Map ild_db → shelf alpha using first-order approximation
+            f_c = 1000.0 / sr   # shelf corner at 1 kHz (normalised)
+            omega = 2 * np.pi * f_c
+            alpha = (1.0 - ild_lin) * (1.0 - np.cos(omega)) / (1.0 + ild_lin)
+
+        # Apply ILD filter to contralateral channel
+        if itd_samples >= 0:
+            # Right leads → apply ILD to Left (contralateral)
+            for n in range(1, N):
+                L_ir[n] = L_ir[n] * ild_lin + alpha * (L_ir[n] - L_ir[n-1]) * ild_lin
+        else:
+            for n in range(1, N):
+                R_ir[n] = R_ir[n] * ild_lin + alpha * (R_ir[n] - R_ir[n-1]) * ild_lin
+
+        # ── 4. Pinna notch filters on contralateral channel ──────────────────
+        # Real pinna notches only appear in the elevation/rear plane, but we
+        # apply a scaled version to the far ear to simulate the shadowing effect.
+        notch_freqs = [8000, 10500, 13000, 16000]
+        notch_depth = -8.0 * lateral   # dB, scaled by how far off-axis we are
+        notch_bw_hz = 600.0
+
+        if abs(notch_depth) > 0.5:
+            contra = L_ir if itd_samples >= 0 else R_ir
+            freqs  = np.fft.rfftfreq(N, d=1.0/sr)
+            H      = np.ones(len(freqs), dtype=np.complex64)
+            for f0 in notch_freqs:
+                f0_safe = min(f0, sr / 2 - 1)
+                # Peak EQ in frequency domain: H(f) *= 1 + (A-1)·BPF(f)
+                A   = 10.0 ** (notch_depth / 20.0)
+                bpf = (freqs / f0_safe) / (1.0 + ((freqs / f0_safe) - 1.0)**2 +
+                       (notch_bw_hz / f0_safe)**2)
+                H  *= (1.0 + (A - 1.0) * np.abs(bpf))
+            # Apply in frequency domain (minimum-phase approximation)
+            C_freq = np.fft.rfft(contra.astype(np.float64))
+            contra[:] = np.fft.irfft(C_freq * H, n=N).astype(np.float32)
+            if itd_samples >= 0:
+                L_ir = contra
+            else:
+                R_ir = contra
+
+        # ── 5. Gentle raised-cosine window to reduce pre-ringing ────────────
+        win = np.ones(N, dtype=np.float32)
+        taper = 32
+        win[:taper] = 0.5 - 0.5 * np.cos(np.pi * np.arange(taper) / taper)
+        win[-taper:] = 0.5 - 0.5 * np.cos(np.pi * np.arange(taper, 0, -1) / taper)
+        L_ir *= win
+        R_ir *= win
+
+        return L_ir.astype(np.float32), R_ir.astype(np.float32)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HRIR lookup — 3-D trilinear interpolation
+
+    @staticmethod
+    def _bracket(arr: List[int], val: float) -> tuple:
+        """
+        Return (lo, hi, t) for linear interpolation in a sorted list.
+        Clamps to [arr[0], arr[-1]].
+        """
+        if not arr:
+            return 0, 0, 0.0
+        if val <= arr[0]:
+            return arr[0], arr[0], 0.0
+        if val >= arr[-1]:
+            return arr[-1], arr[-1], 0.0
+        for i in range(len(arr) - 1):
+            if arr[i] <= val <= arr[i + 1]:
+                span = float(arr[i + 1] - arr[i])
+                t    = (val - arr[i]) / span if span > 0.0 else 0.0
+                return arr[i], arr[i + 1], float(np.clip(t, 0.0, 1.0))
+        return arr[-1], arr[-1], 0.0
+
+    def _interp_azimuth(
+        self,
+        az_arr: np.ndarray,   # float32 (N_az,)  sorted azimuths
+        L_mat:  np.ndarray,   # float32 (N_az, HRIR_N)
+        R_mat:  np.ndarray,
+        az_deg: float,
+    ) -> tuple:
+        """
+        Circular linear interpolation between adjacent azimuth measurements.
+        Handles the 355° → 0° wrap correctly.
+        """
+        az_norm = float(az_deg % 360.0)
+        n       = len(az_arr)
+
+        # Find insertion point; wrap index for circular lookup
+        idx_hi = int(np.searchsorted(az_arr, az_norm)) % n
+        idx_lo = (idx_hi - 1) % n
+
+        az_lo = float(az_arr[idx_lo])
+        az_hi = float(az_arr[idx_hi])
+
+        # Unwrap high side when wrapping past 360°
+        if idx_hi == 0 or az_hi < az_lo:
+            az_hi += 360.0
+            az_w   = az_norm if az_norm >= az_lo else az_norm + 360.0
+        else:
+            az_w   = az_norm
+
+        span = max(az_hi - az_lo, 1e-6)
+        t    = float(np.clip((az_w - az_lo) / span, 0.0, 1.0))
+
+        L = ((1.0 - t) * L_mat[idx_lo] + t * L_mat[idx_hi]).astype(np.float32)
+        R = ((1.0 - t) * R_mat[idx_lo] + t * R_mat[idx_hi]).astype(np.float32)
+        return L, R
+
+    def _sofa_slice(
+        self, d_cm: int, e_deg: int, az_deg: float
+    ) -> Optional[tuple]:
+        """
+        Return azimuth-interpolated HRIR pair at an exact (dist, elev) grid
+        point.  Returns None if that combination is missing from the table.
+        """
+        d_tbl = self.sofa_table.get(d_cm)
+        if d_tbl is None:
+            return None
+        slot = d_tbl.get(e_deg)
+        if slot is None:
+            return None
+        az_arr, L_mat, R_mat = slot
+        return self._interp_azimuth(az_arr, L_mat, R_mat, az_deg)
+
+    def _hrir_for_position(
+        self,
+        az_deg:   float,
+        elev_deg: float = 0.0,
+        dist_cm:  float = 100.0,
+    ) -> tuple:
+        """
+        Trilinear interpolation in (azimuth × elevation × distance) space
+        using the SOFA lookup table.
+
+        Falls back to legacy _hrir_for_angle() when SOFA is not loaded.
+        """
+        if not self.using_sofa:
+            return self._hrir_for_angle(az_deg)
+
+        d_lo, d_hi, td = self._bracket(self.sofa_dists, dist_cm)
+        e_lo, e_hi, te = self._bracket(self.sofa_elevs, elev_deg)
+
+        # 4 bilinear corners in (dist, elev) — azimuth interpolation is done
+        # inside _sofa_slice for each corner
+        corners = [(d_lo, e_lo), (d_lo, e_hi), (d_hi, e_lo), (d_hi, e_hi)]
+        weights = [
+            (1.0 - td) * (1.0 - te),
+            (1.0 - td) *        te,
+                   td  * (1.0 - te),
+                   td  *        te,
+        ]
+
+        L_acc = np.zeros(self.HRIR_N, dtype=np.float64)
+        R_acc = np.zeros(self.HRIR_N, dtype=np.float64)
+        w_sum = 0.0
+
+        for (d, e), w in zip(corners, weights):
+            if w < 1e-7:
+                continue
+            result = self._sofa_slice(d, e, az_deg)
+            if result is None:
+                continue          # missing measurement — skip this corner
+            L_c, R_c = result
+            L_acc += w * L_c.astype(np.float64)
+            R_acc += w * R_c.astype(np.float64)
+            w_sum += w
+
+        if w_sum < 1e-7:
+            return self._hrir_for_angle(az_deg)   # all corners missing
+
+        # Re-normalise if any corner was absent
+        if w_sum < 0.999:
+            L_acc /= w_sum
+            R_acc /= w_sum
+
+        return L_acc.astype(np.float32), R_acc.astype(np.float32)
+
+    def _hrir_for_angle(self, az_deg: float) -> tuple:
+        """
+        Legacy azimuth-only lookup for the numpy / synthetic fallback path.
+        Linear interpolation between adjacent azimuths.
+        """
+        az_norm = az_deg % 360
+        idx_f   = az_norm / self.AZ_STEP
+        idx_lo  = int(idx_f) % self.N_AZ
+        idx_hi  = (idx_lo + 1) % self.N_AZ
+        t       = idx_f - int(idx_f)
+
+        L_lo, R_lo = self.hrirs[idx_lo]
+        L_hi, R_hi = self.hrirs[idx_hi]
+
+        L = ((1.0 - t) * L_lo + t * L_hi).astype(np.float32)
+        R = ((1.0 - t) * R_lo + t * R_hi).astype(np.float32)
+        return L, R
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Angle trajectory
+
+    def _angle_trajectory(
+        self,
+        n_samples: int,
+        rotation_speed: float,
+        beat_times_s: Optional[List[float]],
+    ) -> np.ndarray:
+        """
+        Return azimuth in degrees for every sample.
+        Beat-locked: tracks actual beat timing from librosa.
+        Free-running: simple ramp at rotation_speed Hz.
+        """
+        t = np.arange(n_samples, dtype=np.float64) / self.sr
+
+        if beat_times_s and len(beat_times_s) >= 2:
+            # Piecewise linear beat phase (same algorithm as _beat_phase_expr)
+            beat_phase = np.zeros(n_samples, dtype=np.float64)
+            times = beat_times_s
+            for k in range(len(times) - 1):
+                t_k   = times[k]
+                t_nxt = times[k + 1]
+                dur   = max(t_nxt - t_k, 0.01)
+                mask  = (t >= t_k) & (t < t_nxt)
+                beat_phase[mask] = k + (t[mask] - t_k) / dur
+            # Extrapolate after last beat
+            dt_last = max(times[-1] - times[-2], 0.01)
+            mask_tail = t >= times[-1]
+            beat_phase[mask_tail] = (
+                (len(times) - 1) + (t[mask_tail] - times[-1]) / dt_last
+            )
+            # Scale: rotation_speed / beat_freq rotations per beat
+            median_ibi = np.median(np.diff(times[:min(len(times), 40)]))
+            beat_freq  = 1.0 / max(median_ibi, 0.05)
+            speed_ratio = rotation_speed / beat_freq
+            az_deg = (beat_phase * speed_ratio * 360.0) % 360.0
+        else:
+            az_deg = (rotation_speed * t * 360.0) % 360.0
+
+        return az_deg
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Main render
+
+    def render(
+        self,
+        mono:           np.ndarray,
+        beat_times_s:   Optional[List[float]],
+        rotation_speed: float,
+        elevation:      float = 0.0,
+        distance_m:     float = 1.0,
+    ) -> np.ndarray:
+        """
+        Convolve mono audio with a time-varying binaural HRIR.
+
+        Arguments:
+          mono           : (N,) float32/64 — mono audio
+          beat_times_s   : beat onsets in seconds (None → free-running LFO)
+          rotation_speed : Hz (source orbits/second)
+          elevation      : normalised [-1, 1]
+                             +1 → top of SOFA elevation range (e.g. +35°)
+                             -1 → bottom of SOFA elevation range (e.g. -25°)
+          distance_m     : virtual source distance in metres.
+                             0.20–1.10 maps directly into SOFA data range.
+                             Values outside range are clamped.
+
+        Returns:
+          stereo : float32 (2, N)  — [0] = Left,  [1] = Right
+        """
+        if not ADVANCED_ANALYSIS:
+            raise RuntimeError("HRIREngine requires scipy (pip install scipy)")
+
+        from scipy.signal import fftconvolve
+
+        n_samples = len(mono)
+        az_traj   = self._angle_trajectory(n_samples, rotation_speed, beat_times_s)
+
+        # ── Map (elevation, distance) → SOFA coordinates ─────────────────────
+        if self.using_sofa:
+            d_min = float(self.sofa_dists[0])
+            d_max = float(self.sofa_dists[-1])
+            dist_cm = float(np.clip(distance_m * 100.0, d_min, d_max))
+
+            e_min = float(self.sofa_elevs[0])   # e.g. -25
+            e_max = float(self.sofa_elevs[-1])   # e.g. +35
+            # Positive elevation → towards top of range; negative → towards bottom
+            elev_deg = float(
+                np.clip(elevation * (e_max if elevation >= 0.0 else -e_min),
+                        e_min, e_max)
+            )
+        else:
+            # Synthetic/numpy path: simulate elevation by scaling lateral spread
+            dist_cm  = distance_m * 100.0
+            elev_deg = elevation * 90.0   # unused in legacy path
+
+        # ── OLA (overlap-add) block processing ───────────────────────────────
+        out_L = np.zeros(n_samples + self.HRIR_N, dtype=np.float64)
+        out_R = np.zeros(n_samples + self.HRIR_N, dtype=np.float64)
+
+        n_blocks = (n_samples + self.BLOCK - 1) // self.BLOCK
+
+        for b in range(n_blocks):
+            start = b * self.BLOCK
+            end   = min(start + self.BLOCK, n_samples)
+            block = mono[start:end].astype(np.float64)
+
+            # Azimuth at mid-block sample
+            mid_idx = (start + end) // 2
+            az      = float(az_traj[mid_idx] % 360.0)
+
+            if self.using_sofa:
+                L_ir, R_ir = self._hrir_for_position(az, elev_deg, dist_cm)
+            else:
+                # Legacy path: collapse elevation into lateral-axis scaling
+                elev_scale = float(np.cos(elevation * np.pi / 2))
+                az_eff     = (az - 180.0) * elev_scale + 180.0
+                L_ir, R_ir = self._hrir_for_angle(az_eff)
+
+            seg_len = len(block) + self.HRIR_N - 1
+            out_L[start: start + seg_len] += fftconvolve(
+                block, L_ir.astype(np.float64))[:seg_len]
+            out_R[start: start + seg_len] += fftconvolve(
+                block, R_ir.astype(np.float64))[:seg_len]
+
+        # ── Trim + normalise ─────────────────────────────────────────────────
+        stereo = np.stack([
+            out_L[:n_samples].astype(np.float32),
+            out_R[:n_samples].astype(np.float32),
+        ])
+
+        peak = float(np.max(np.abs(stereo))) + 1e-10
+        if peak > 0.99:
+            stereo /= peak * 1.01
+
+        return stereo
+
+
+# Singleton — instantiated lazily on first use
+_hrir_engine: Optional['HRIREngine'] = None
+
+def get_hrir_engine(sr: int = 48000) -> 'HRIREngine':
+    global _hrir_engine
+    if _hrir_engine is None or _hrir_engine.sr != sr:
+        _hrir_engine = HRIREngine(sample_rate=sr)
+    return _hrir_engine
+
+
+# ============================================================================
 # WEBSOCKET MANAGER
 # ============================================================================
 
@@ -1446,388 +2568,111 @@ def _reverb(p: ProcessingParams) -> str:
 
 
 # ============================================================================
+# BEAT-SYNC ROTATION  — v9.1 (replaces broken v9.0 piecewise expression)
+# ============================================================================
+#
+# v9.0 generated a piecewise if(gte(t,...), cos(...), if(...)) expression
+# with one level per beat — up to 300 levels deep. FFmpeg's expression
+# evaluator silently failed on expressions that large, defaulting every
+# volume filter to gain=1. Result: zero panning on any beat-detected track.
+#
+# v9.1 replaces this with a simple, reliable approach:
+#   1. Compute the median inter-beat interval from librosa's beat array.
+#   2. Derive the actual BPM from that interval.
+#   3. Pick a rotation speed that is a clean musical ratio of the BPM
+#      (e.g. 1 rotation per 4 beats).
+#   4. Pass that speed to build_8band_hrtf_engine_v6 as a normal float.
+#
+# The spatial effect stays musically locked without any complex expressions.
+# beat_positions from the analysis result ARE used — just for arithmetic,
+# not for generating FFmpeg filter strings.
+
+def beat_sync_rotation_speed(
+    beat_times_s: List[float],
+    base_rotation_speed: float,
+) -> float:
+    """
+    Derive a musically-locked rotation speed from beat timestamps.
+
+    Computes median BPM from beat_times_s, then finds the nearest musical
+    ratio (1/8, 1/4, 1/2, 1, 2 rotations per beat) that keeps the rotation
+    speed within [0.05, 0.5] Hz.  Falls back to base_rotation_speed if
+    beats are too few or the result is out of range.
+    """
+    if not beat_times_s or len(beat_times_s) < 4:
+        return base_rotation_speed
+
+    ibis = [beat_times_s[k+1] - beat_times_s[k]
+            for k in range(min(len(beat_times_s)-1, 60))]
+    ibis.sort()
+    median_ibi = ibis[len(ibis) // 2]
+    if median_ibi < 0.05:
+        return base_rotation_speed   # unreasonably fast beats
+
+    beat_freq = 1.0 / median_ibi   # Hz (= BPM / 60)
+
+    # Musical ratios: rotations per beat
+    ratios = [1/8, 1/6, 1/4, 1/3, 1/2, 1.0, 2.0]
+    candidates = [beat_freq * r for r in ratios]
+
+    # Find the candidate closest to base_rotation_speed within [0.04, 0.6] Hz
+    valid = [(abs(c - base_rotation_speed), c) for c in candidates if 0.04 <= c <= 0.6]
+    if not valid:
+        return base_rotation_speed
+
+    _, best = min(valid)
+    return round(best, 4)
+
+
+# ============================================================================
 # STUDIO GRADE v6.0  — 8-band HRTF + ITD + Pinna EQ + Diffuse-Field EQ
 # ============================================================================
 
-def build_8band_hrtf_engine_v6(p: ProcessingParams) -> tuple:
+def build_stereo_mastering_chain(p: ProcessingParams) -> tuple:
     """
-    8-Band Spatial Audio Engine v7.1  (replaces broken v6.0 LFO)
+    Post-HRIR mastering chain — stereo-in, stereo-out.
 
-    ═══ ROOT CAUSE FIXES ═══════════════════════════════════════════════════
+    Used after the Python HRIR convolution engine has already produced a
+    binaural stereo WAV.  This chain must NOT collapse L/R to mono.
 
-    BUG 1 — Silent dead zones at back (was the primary complaint):
-      Old:  vol_l = sin(2π·rot·t)   → negative half-cycle = 0 gain in FFmpeg
-            vol_r = cos(2π·rot·t)   → same; both channels simultaneously silent
-                                       when source is behind listener.
-      Fix:  Use a proper ILD (Interaural Level Difference) formula that NEVER
-            goes below a minimum floor.  cos(θ) drives L/R balance:
-              pan_R = floor + (1−2·floor)·½·(1 + cos θ)   range [floor, 1−floor]
-              pan_L = floor + (1−2·floor)·½·(1 − cos θ)   range [floor, 1−floor]
-            floor = 0.12 → quietest ear always at 12 % of peak, not silent.
+    Applies only:
+      • Reverb (single aecho — no triple chain)
+      • Diffuse-field headphone EQ (3 bands)
+      • 12-band master EQ
+      • EBU R128 loudnorm
+      • True peak limiter
 
-    BUG 2 — Aggressive lowpass on contra-lateral channel:
-      Old:  lowpass=f={cutoff} where cutoff could reach 1000 Hz — a wall of mud.
-            Instruments above 1 kHz completely wiped from one channel.
-      Fix:  Replaced with a GENTLE high-shelf EQ at 8 kHz (−5 dB maximum).
-            The ear on the far side of the head still hears everything,
-            just with a perceptually natural HF rolloff — not a lowpass brick.
-
-    BUG 3 — No front / rear spectral character:
-      Old:  Back position sounds like front but quieter (same EQ path).
-      Fix:  Parallel front/rear EQ paths blended continuously by sin(θ):
-              front_blend = 0.5 + 0.5·sin θ  (1.0 at front, 0.0 at back)
-              rear_blend  = 0.5 − 0.5·sin θ  (0.0 at front, 1.0 at back)
-            The two paths sum to unity gain always.
-
-              Front EQ: +2 dB presence @ 3 kHz, +2.5 dB air shelf @ 8 kHz
-                        — bright, detailed, close-sounding
-              Rear EQ:  +3.5 dB body @ 350 Hz, +2 dB warmth @ 1.2 kHz,
-                        −4 dB gentle shelf @ 6 kHz
-                        — warm, immersive "behind" sensation WITHOUT killing
-                           instruments; the 350 Hz push keeps bass guitar,
-                           kick, and low mids fully present at back.
-
-      Applied only to directional bands (600 Hz+); sub/bass/lowm are
-      omni-directional so a simple ILD pan is sufficient there.
-
-    ═══ RETAINED FROM v6.0 ═════════════════════════════════════════════════
-      ITD inter-ear delays (per-band μs table)
-      Pinna notch EQ (8.5 / 10.5 / 13 kHz)
-      Per-band LFO phase offsets (comb-filter avoidance)
-      Distance attenuation, allpass diffusion, pre-reverb, diffuse-field EQ,
-      equal-loudness shelf, 12-band master EQ, loudnorm, alimiter
-
-    ═══ ROTATION GEOMETRY ══════════════════════════════════════════════════
-      θ = 2π·rot·t,  starting at t=0 with source to the RIGHT.
-        θ = 0:    source right   (R louder,  equal front/rear blend)
-        θ = π/2:  source FRONT   (L = R,     100 % front EQ)
-        θ = π:    source left    (L louder,  equal front/rear blend)
-        θ = 3π/2: source BEHIND  (L = R,     100 % rear EQ)
-
-    ITD table (μs):
-      sub (<80 Hz) : 0    bass (80–250)  : 80
-      lowm(250–600): 200  voc (600–2k)   : 350
-      highm(2–4k)  : 450  pres (4–8k)    : 520
-      air (8–14k)  : 580  spark(14–22k)  : 630
+    No pan=mono, no stereotools split, no per-channel processing.
     """
-    i    = p.intensity_multiplier
-    dvol = 1.0 / max(p.distance, 0.3)
+    eq  = _eq_chain(p)
+    rev = _reverb(p)
 
-    # ── Rotation speeds (per band) ──────────────────────────────────────────
-    r_sub   = p.bass_rotation   * i * 0.40
-    r_bass  = p.bass_rotation   * i * 0.70
-    r_lowm  = p.rotation_speed  * i * 0.80
-    r_voc   = p.rotation_speed  * i * 0.50   # vocals rotate slower
-    r_highm = p.treble_rotation * i * 0.90
-    r_pres  = p.treble_rotation * i * 1.10
-    r_air   = p.treble_rotation * i * 1.30
-    r_spark = p.treble_rotation * i * 1.50
-
-    # ── Per-band phase offsets — staggers bands so they're never all ────────
-    # pointing the same direction at once (prevents comb-filter peaks)
-    PHASE = {'sub': 0.00, 'bass': 0.40, 'lowm': 0.85, 'voc': 1.30,
-             'highm': 1.75, 'pres': 2.25, 'air': 2.80, 'spark': 3.40}
-
-    ITD_US = {'sub': 0, 'bass': 80, 'lowm': 200, 'voc': 350,
-              'highm': 450, 'pres': 520, 'air': 580, 'spark': 630}
-
-    # ── ILD floor: quietest ear never fully silent ──────────────────────────
-    # Distance-adaptive: closer sources have more extreme L/R separation
-    # (a speaker 1 m away is much more asymmetric than one at 5 m).
-    #   distance=0.3 (close) → floor=0.06  (very directional)
-    #   distance=1.0 (normal) → floor=0.12 (standard)
-    #   distance=2.0 (far)    → floor=0.20 (diffuse, near-central)
-    FLOOR = round(min(0.22, max(0.05, 0.12 * p.distance)), 4)
-
-    # ── Parallel front/rear EQ definitions ─────────────────────────────────
-    # Front: bright, present — listener hears this when sound is ahead
-    FRONT_EQ = (
-        "equalizer=f=3000:t=q:w=2500:g=2.0,"
-        "equalizer=f=8000:t=h:w=4000:g=2.5"
-    )
-    # Rear: warm & body-forward — instruments stay FULLY audible from behind;
-    # the gentle 6 kHz shelf trim (not a lowpass!) gives the "behind" character.
-    REAR_EQ = (
-        "equalizer=f=350:t=q:w=280:g=3.5,"
-        "equalizer=f=1200:t=q:w=1000:g=2.0,"
-        "equalizer=f=6000:t=h:w=5000:g=-4.0"
+    # Diffuse-field EQ — 3 key points only (not the full 6-point version
+    # which over-corrects and stacks with the EQ chain below)
+    dfeq_simple = (
+        "equalizer=f=2500:t=q:w=3000:g=3.0,"
+        "equalizer=f=5000:t=q:w=2000:g=-4.0,"
+        "equalizer=f=10000:t=h:w=4000:g=3.5"
     )
 
-    def _hrtf_band_v71(lbl, lo, hi, rot, ph_off=0.0,
-                       itd_us=0, apply_pinna=False, apply_rear_eq=False,
-                       vocal_center=False):
-        px  = []
-        inp = f"[{lbl}_in]"
-        # rotation angle (radians), with per-band phase offset
-        theta = f"2*PI*{rot:.5f}*t+{ph_off:.4f}"
-
-        # ── 1. Bandpass ─────────────────────────────────────────────────────
-        if lo <= 20:
-            px.append(f"{inp}lowpass=f={hi}[{lbl}_f]")
-        elif hi >= 22000:
-            px.append(f"{inp}highpass=f={lo}[{lbl}_f]")
-        else:
-            px.append(f"{inp}bandpass=f={(lo+hi)//2}:width_type=h:w={hi-lo}[{lbl}_f]")
-
-        # ── 2. Per-band gentle compression ──────────────────────────────────
-        px.append(
-            f"[{lbl}_f]acompressor=threshold=-20dB:ratio=2:attack=10:release=50[{lbl}_c]"
-        )
-
-        if apply_rear_eq:
-            # ── 3a. Parallel front/rear EQ paths ────────────────────────────
-            #   front_blend = 0.5 + 0.5·sin(θ) → 1.0 at front, 0.0 at back
-            #   rear_blend  = 0.5 − 0.5·sin(θ) → 0.0 at front, 1.0 at back
-            #   They sum to 1.0 always — no gain pumping through the rotation.
-            px.append(f"[{lbl}_c]asplit=2[{lbl}_fp][{lbl}_rp]")
-            px.append(f"[{lbl}_fp]{FRONT_EQ}[{lbl}_feq]")
-            px.append(f"[{lbl}_rp]{REAR_EQ}[{lbl}_req]")
-
-            f_blend = f"0.5+0.5*sin({theta})"
-            r_blend = f"0.5-0.5*sin({theta})"
-            px.append(f"[{lbl}_feq]volume='{f_blend}':eval=frame[{lbl}_fb]")
-            px.append(f"[{lbl}_req]volume='{r_blend}':eval=frame[{lbl}_rb]")
-            # amix sums the two unity-partitioned paths → no level change
-            px.append(
-                f"[{lbl}_fb][{lbl}_rb]amix=inputs=2:duration=first:normalize=0[{lbl}_eq_out]"
-            )
-            src = f"{lbl}_eq_out"
-        else:
-            src = f"{lbl}_c"
-
-        # ── 4. Split into L / R channels ────────────────────────────────────
-        px.append(f"[{src}]asplit=2[{lbl}_Ls][{lbl}_Rs_raw]")
-
-        # ── 5. ILD pan — cos-based, never silent ────────────────────────────
-        #   cos(θ)=+1 → source right  → R loud, L quiet
-        #   cos(θ)= 0 → source front or back → equal
-        #   cos(θ)=−1 → source left   → L loud, R quiet
-        #
-        #   Depth: 1−2·FLOOR so the maximum swing stays within [FLOOR, 1−FLOOR]
-        depth = round(1.0 - 2 * FLOOR, 4)
-        if vocal_center:
-            # Vocal center: tighter pan width so voice stays more centred
-            vc_depth = round(depth * 0.35, 4)
-            pan_L = f"({FLOOR + depth * 0.5:.4f}+{vc_depth:.4f}*(-cos({theta})))"
-            pan_R = f"({FLOOR + depth * 0.5:.4f}+{vc_depth:.4f}*(cos({theta})))"
-        else:
-            pan_L = f"({FLOOR:.4f}+{depth:.4f}*(0.5-0.5*cos({theta})))"
-            pan_R = f"({FLOOR:.4f}+{depth:.4f}*(0.5+0.5*cos({theta})))"
-
-        px.append(f"[{lbl}_Ls]volume='{pan_L}':eval=frame[{lbl}_Lv]")
-        px.append(f"[{lbl}_Rs_raw]volume='{pan_R}':eval=frame[{lbl}_Rv]")
-
-        # ── 6. ITD — symmetric bilateral inter-ear delay ─────────────────────
-        #
-        # BUG FIX: The old code applied adelay={itd_ms}|0 — a STATIC delay
-        # only on the right channel. This created a permanent left-side bias
-        # because the brain interprets a constant "R leads L" timing cue as
-        # the source always being to the LEFT, regardless of ILD panning.
-        #
-        # Fix: Apply the ITD to BOTH channels symmetrically. The half-ITD
-        # is applied to each channel, giving the correct relative inter-ear
-        # timing difference without biasing either side:
-        #   L delayed by itd/2  when source is to the right (R leads)
-        #   R delayed by itd/2  when source is to the left  (L leads)
-        # We approximate this in static FFmpeg filters by applying the full
-        # ITD on R and L alternately, blended by the rotation LFO, so the
-        # net effect is a smooth, direction-dependent delay with no DC bias.
-        # For simplicity and compatibility, we use a half-strength delay on
-        # R only (half the original value), which reduces the bias to ±30 μs
-        # rather than ±630 μs — perceptible as depth but not a hard offset.
-        right_sig = f"{lbl}_Rv"
-        if itd_us > 0:
-            # Clamp to minimum 1 sample at 48 kHz (≈ 0.021 ms) so FFmpeg
-            # adelay doesn't silently round tiny values to zero.
-            MIN_SAMPLE_MS = 1000.0 / 48000.0  # ≈ 0.0208 ms
-            itd_half_ms = max((itd_us / 2) / 1000.0, MIN_SAMPLE_MS)
-            # Apply symmetric half-delay: both channels delayed by half ITD
-            # relative to each other using a stereo join trick.
-            # Join L-undelayed and R-delayed, then re-split — net ITD = itd/2.
-            px.append(f"[{lbl}_Lv]asplit=2[{lbl}_Lv0][{lbl}_Lv1]")
-            px.append(f"[{right_sig}]asplit=2[{lbl}_Rv0][{lbl}_Rv1]")
-            # Path when source is to the right (cos θ > 0): delay R
-            px.append(f"[{lbl}_Rv0]adelay={itd_half_ms:.3f}[{lbl}_Rv_dR]")
-            # Path when source is to the left  (cos θ < 0): delay L
-            px.append(f"[{lbl}_Lv1]adelay={itd_half_ms:.3f}[{lbl}_Lv_dL]")
-            # LFO blend: right_w = 0.5+0.5*cos(θ), left_w = 0.5-0.5*cos(θ)
-            rw = f"(0.5+0.5*cos({theta}))"
-            lw = f"(0.5-0.5*cos({theta}))"
-            # L channel: un-delayed * right_w  +  L_delayed * left_w
-            px.append(f"[{lbl}_Lv0]volume='{rw}':eval=frame[{lbl}_La]")
-            px.append(f"[{lbl}_Lv_dL]volume='{lw}':eval=frame[{lbl}_Lb]")
-            px.append(f"[{lbl}_La][{lbl}_Lb]amix=inputs=2:duration=first:normalize=0[{lbl}_Lv_itd]")
-            # R channel: R_delayed * right_w  +  un-delayed * left_w
-            px.append(f"[{lbl}_Rv_dR]volume='{rw}':eval=frame[{lbl}_Ra]")
-            px.append(f"[{lbl}_Rv1]volume='{lw}':eval=frame[{lbl}_Rb]")
-            px.append(f"[{lbl}_Ra][{lbl}_Rb]amix=inputs=2:duration=first:normalize=0[{lbl}_Rv_itd]")
-            # Update both L and R signal references for downstream steps
-            left_sig  = f"{lbl}_Lv_itd"
-            right_sig = f"{lbl}_Rv_itd"
-        else:
-            left_sig = f"{lbl}_Lv"
-
-        # ── 7. Pinna notch on right channel (high-frequency bands only) ──────
-        if apply_pinna and p.hrtf_intensity > 0:
-            pinna_str = _pinna_notch_filters(p.hrtf_intensity)
-            if pinna_str:
-                px.append(f"[{right_sig}]{pinna_str}[{lbl}_Rp]")
-                right_sig = f"{lbl}_Rp"
-
-        # ── 8. Head shadow — SOFT high-shelf (replaces brutal lowpass) ───────
-        #   Old code used lowpass=f=1000…5000 which killed all instruments.
-        #   Real head shadow: gentle attenuation above 8 kHz (≤ −5 dB).
-        #   Lower frequencies pass through unchanged — bass/mids always present.
-        if apply_pinna and p.hrtf_intensity > 0:
-            shadow_db = round(-5.0 * min(p.hrtf_intensity, 1.0), 1)
-            px.append(
-                f"[{right_sig}]equalizer=f=8000:t=h:w=5000:g={shadow_db}[{lbl}_Rs]"
-            )
-            right_sig = f"{lbl}_Rs"
-
-        # ── 9. Join stereo + distance ────────────────────────────────────────
-        px.append(
-            f"[{left_sig}][{right_sig}]join=inputs=2:channel_layout=stereo[{lbl}_st]"
-        )
-        px.append(f"[{lbl}_st]volume={dvol:.4f}[{lbl}_8d]")
-
-        return px
-
-    # ── Assemble all 8 bands ─────────────────────────────────────────────────
     parts = [
-        "pan=mono|c0=0.5*c0+0.5*c1[mono_src]",
-        "[mono_src]asplit=8[sub_in][bass_in][lowm_in][voc_in][highm_in][pres_in][air_in][spark_in]",
+        # ── reverb mix (wet/dry blend using aecho) ──
+        f"[0:a]{rev}[rev_out]",
+        # dry/wet recombine is handled inside _reverb via in_gain/out_gain
     ]
 
-    # Low-frequency bands: apply SUBTLE rear EQ for front/back depth cues.
-    # Previously these had apply_rear_eq=False — meaning all bass/sub energy
-    # only panned left/right (no front/back). This made the 3D effect feel flat.
-    # The REAR_EQ is a gentle spectral tilt, not a destructive filter, so applying
-    # it at low frequencies adds depth without killing bass impact.
-    parts += _hrtf_band_v71("sub",   20,    80,   r_sub,   ph_off=PHASE['sub'],
-                             itd_us=ITD_US['sub'],   apply_rear_eq=True)
-    parts += _hrtf_band_v71("bass",  80,    250,  r_bass,  ph_off=PHASE['bass'],
-                             itd_us=ITD_US['bass'],  apply_rear_eq=True)
-    parts += _hrtf_band_v71("lowm",  250,   600,  r_lowm,  ph_off=PHASE['lowm'],
-                             itd_us=ITD_US['lowm'],  apply_rear_eq=True)
+    last = "rev_out"
 
-    # Mid/high bands: apply parallel front/rear EQ for full directional character
-    parts += _hrtf_band_v71("voc",   600,   2000, r_voc,   ph_off=PHASE['voc'],
-                             itd_us=ITD_US['voc'],   apply_rear_eq=True,
-                             vocal_center=p.enable_vocal_center)
-    parts += _hrtf_band_v71("highm", 2000,  4000, r_highm, ph_off=PHASE['highm'],
-                             itd_us=ITD_US['highm'], apply_rear_eq=True)
-    parts += _hrtf_band_v71("pres",  4000,  8000, r_pres,  ph_off=PHASE['pres'],
-                             itd_us=ITD_US['pres'],  apply_pinna=True, apply_rear_eq=True)
-    parts += _hrtf_band_v71("air",   8000,  14000, r_air,  ph_off=PHASE['air'],
-                             itd_us=ITD_US['air'],   apply_pinna=True, apply_rear_eq=True)
-    parts += _hrtf_band_v71("spark", 14000, 22000, r_spark, ph_off=PHASE['spark'],
-                             itd_us=ITD_US['spark'], apply_pinna=True, apply_rear_eq=True)
-
-    # Mix all 8 bands
-    band_outs = "".join([f"[{b}_8d]" for b in ["sub","bass","lowm","voc","highm","pres","air","spark"]])
-    parts.append(f"{band_outs}amix=inputs=8:duration=first:normalize=0[mixed_direct]")
-
-    # Dry / wet split for reverb
-    rev_wet = p.reverb_mix * 0.6
-    rev_dry = 1.0 - rev_wet
-    parts.append("[mixed_direct]asplit=2[dry_sig][rev_input]")
-
-    # Allpass diffusion network (early reflections) — now scales with room size
-    diffuser = _allpass_diffuser(p.reverb_room)
-    parts.append(f"[rev_input]{diffuser}[diffused]")
-
-    # Haas-effect widener: short R-channel delay (8–18 ms) for early stereo spread
-    # Applied AFTER diffusion, BEFORE the main reverb tail, so it enriches the
-    # early-reflection stage without muddying the reverb decay.
-    haas = _haas_widener(p.reverb_room)
-    parts.append(f"[diffused]{haas}[haas_wide]")
-
-    # Pre-delay (simulates distance to first wall)
-    pre_delay_ms = round(15.0 + p.reverb_room * 20.0, 1)
-    parts.append(f"[haas_wide]adelay={pre_delay_ms}|{pre_delay_ms}[pre_delayed]")
-
-    # Main reverb
-    rev_density = p.reverb_density
-    if check_reverberate_filter():
-        room_size = int(p.reverb_room * 100)
-        decay_ms  = int(rev_density * 5000)
-        damping   = 1 - rev_density
-        parts.append(
-            f"[pre_delayed]reverberate=room_size={room_size}:time={decay_ms}"
-            f":damping={damping:.2f}:wet={rev_wet:.2f}:dry=0[wet_rev]"
-        )
-        print("  ↳ Using 'reverberate' (FFmpeg 5.0+)")
-    else:
-        d1 = int(37 * rev_density * p.reverb_room)
-        d2 = int(73 * rev_density * p.reverb_room)
-        d3 = int(127* rev_density * p.reverb_room)
-        d4 = int(193* rev_density * p.reverb_room)
-        dc1 = rev_density * 0.65; dc2 = rev_density * 0.45
-        dc3 = rev_density * 0.28; dc4 = rev_density * 0.18
-        parts.append(
-            f"[pre_delayed]aecho=in_gain={1-rev_wet*0.3:.2f}:out_gain={rev_wet*0.75:.2f}"
-            f":delays={d1}|{d2}|{d3}|{d4}"
-            f":decays={dc1:.2f}|{dc2:.2f}|{dc3:.2f}|{dc4:.2f}[wet_rev]"
-        )
-        print("  ↳ Using optimized 4-tap 'aecho' fallback")
-
-    # Mix dry + wet
-    parts.append(f"[dry_sig]volume={rev_dry:.3f}[dry_vol]")
-    parts.append("[dry_vol][wet_rev]amix=inputs=2:duration=first[post_rev]")
-
-    # Diffuse-field EQ (headphone linearization)
-    dfeq = _diffuse_field_eq()
-    parts.append(f"[post_rev]{dfeq}[dfeq_out]")
-
-    # Equal-loudness compensation
-    el = _equal_loudness_shelf()
-    parts.append(f"[dfeq_out]{el}[el_out]")
-
-    # Master 12-band EQ
-    eq = _eq_chain(p)
     if eq:
-        parts.append(f"[el_out]{eq}[eq_master]")
-        last = "eq_master"
-    else:
-        last = "el_out"
+        parts.append(f"[{last}]{eq}[eq_out]")
+        last = "eq_out"
 
-    # Instrument enhancement (after EQ, before width)
-    enh = _instrument_enhance_chain(p)
-    if enh:
-        parts.append(f"[{last}]{enh}[enhanced]")
-        last = "enhanced"
+    parts.append(f"[{last}]{dfeq_simple}[dfeq_out]")
+    last = "dfeq_out"
 
-    # Stereo width (Mid/Side)
-    parts.append(f"[{last}]stereotools=mlev={p.stereo_width:.3f}:sbal=0:softclip=1[wide]")
+    parts.append(f"[{last}]loudnorm=I=-16:TP=-1.5:LRA=11:linear=true[loud]")
+    last = "loud"
 
-    # Loudness normalization (EBU R128)
-    parts.append("[wide]loudnorm=I=-16:TP=-1.5:LRA=11:linear=true[loud]")
-    last = "loud"  # BUG FIX: update last so the elevation block reads from [loud],
-                   # not from the pre-stereotools node ("enhanced" / "eq_master").
-                   # Without this, any track with elevation ≠ 0 silently skipped
-                   # both stereotools and loudnorm.
-
-    # Elevation tilt — v8.1 dual-band model
-    # Old: single high shelf at 8 kHz (oversimplified)
-    # New: two-band model — high shelf for perceived height + low-mid cut for
-    #      "flooring" effect, matching real HRTF elevation data:
-    #   Elevation > 0 (above):  +HF shelf (bright, airy) + slight sub-cut
-    #   Elevation < 0 (below):  −HF shelf (darker, earthed) + slight sub-boost
-    if abs(p.elevation) > 0.01:
-        eg_hi  = round(p.elevation * 6.0, 1)      # ±6 dB at 8 kHz
-        eg_sub = round(-p.elevation * 2.5, 1)     # opposite sign: above→sub cut
-        parts.append(
-            f"[{last}]"
-            f"equalizer=f=8000:t=h:w=3000:g={eg_hi},"
-            f"equalizer=f=80:t=h:w=80:g={eg_sub}"
-            f"[elev]"
-        )
-        last = "elev"
-    else:
-        last = "loud"
-
-    # True peak limiter
     if p.enable_limiter:
         parts.append(f"[{last}]alimiter=limit=1:attack=5:release=50:level=false[out]")
         return ";".join(parts), "[out]"
@@ -1835,9 +2680,265 @@ def build_8band_hrtf_engine_v6(p: ProcessingParams) -> tuple:
     return ";".join(parts), f"[{last}]"
 
 
-# ============================================================================
-# 6-BAND ENGINE  (retained, now with diffuse-field EQ appended)
-# ============================================================================
+def build_8band_hrtf_engine_v6(
+    p: ProcessingParams,
+    beat_times_s: Optional[List[float]] = None,
+) -> tuple:
+    """
+    8-Band Spatial Audio Engine v10.0 — stripped to what actually works.
+
+    Every layer that was killing the audio has been removed:
+      - No pinna notch filters (were always-on-R regardless of rotation)
+      - No diffuse-field EQ post-mix (was stacking -5dB@5kHz cuts)
+      - No equal-loudness shelf post-mix
+      - No per-band acompressor
+      - No complex bilateral ITD blending (added 10 nodes per band for
+        a perceptually inaudible improvement at <0.3ms precision)
+      - No beat-locked FFmpeg expressions (too complex, caused parse failures)
+
+    What remains (what actually works):
+      - Mono downmix → remove fake stereo artefacts
+      - 8-band split with different rotation speeds (bass slow, treble fast)
+      - ILD panning: cos(θ) drives L/R balance with floor=0.12 (no dead zones)
+      - Front/rear character: sin(θ) blends two EQ paths for depth cues
+      - Simple static ITD: one adelay on R channel (clean, no blending noise)
+      - Mild head shadow on R only for bands above 2kHz (gentle, not muffling)
+      - Allpass diffuser + pre-delay + reverb
+      - User 12-band EQ → stereo width → loudnorm → limiter
+    """
+    i    = p.intensity_multiplier
+    dvol = round(1.0 / max(p.distance, 0.3), 4)
+
+    # ── Rotation speeds — derive from BPM if available ────────────────────────
+    base_rot = round(p.rotation_speed * i, 5)
+    if beat_times_s and len(beat_times_s) >= 4:
+        ibi_list = sorted([beat_times_s[k+1] - beat_times_s[k]
+                           for k in range(min(len(beat_times_s)-1, 40))])
+        med_ibi = ibi_list[len(ibi_list) // 2]
+        if 0.2 < med_ibi < 2.0:
+            bpm_rot  = round(1.0 / med_ibi / 4.0, 5)   # 1 rotation per 4 beats
+            base_rot = round((base_rot + bpm_rot) / 2.0, 5)
+            print(f"  \u21b3 BPM-synced rotation: {bpm_rot} Hz \u2192 blended {base_rot} Hz")
+
+    r_sub   = round(p.bass_rotation   * i * 0.40, 5)
+    r_bass  = round(p.bass_rotation   * i * 0.70, 5)
+    r_lowm  = round(base_rot          * 0.80, 5)
+    r_voc   = round(base_rot          * 0.35, 5)  # 0.55→0.35: vocals stay centred
+    r_highm = round(p.treble_rotation * i * 0.90, 5)
+    r_pres  = round(p.treble_rotation * i * 1.10, 5)
+    r_air   = round(p.treble_rotation * i * 1.30, 5)
+    r_spark = round(p.treble_rotation * i * 1.55, 5)
+
+    PHASE  = {'sub': 0.00, 'bass': 0.40, 'lowm': 0.85, 'voc': 1.30,
+              'highm': 1.75, 'pres': 2.25, 'air': 2.80, 'spark': 3.40}
+    # ITD in milliseconds (adelay unit). Max real ITD ≈ 0.63ms.
+    ITD_MS = {'sub': 0.00, 'bass': 0.06, 'lowm': 0.12, 'voc': 0.20,
+              'highm': 0.28, 'pres': 0.35, 'air': 0.45, 'spark': 0.55}
+
+    FLOOR = 0.03  # 0.12→0.03: YouTube 8D uses ~3% floor for strong L/R
+    depth = round(1.0 - 2 * FLOOR, 4)   # 0.94
+
+    # Front: slight presence lift. Rear: warmth + gentle HF rolloff.
+    FRONT_EQ = "equalizer=f=3000:t=q:w=2000:g=1.5"
+    REAR_EQ  = "equalizer=f=400:t=q:w=350:g=2.5,equalizer=f=1500:t=q:w=1200:g=-1.0"
+
+    def band(lbl, lo, hi, rot, ph=0.0, itd_ms=0.0,
+             rear_eq=True, vocal_center=False):
+        px  = []
+        th  = f"2*PI*{rot}*t+{ph}"
+        cos_t = f"cos({th})"
+        sin_t = f"sin({th})"
+
+        # 1. Bandpass
+        if lo <= 20:
+            px.append(f"[{lbl}_in]lowpass=f={hi}[{lbl}_f]")
+        elif hi >= 22000:
+            px.append(f"[{lbl}_in]highpass=f={lo}[{lbl}_f]")
+        else:
+            mid = (lo + hi) // 2
+            px.append(f"[{lbl}_in]bandpass=f={mid}:width_type=h:w={hi-lo}[{lbl}_f]")
+
+        # 2. Front / rear EQ blend — only for bands that contain meaningful content
+        if rear_eq:
+            px.append(f"[{lbl}_f]asplit=2[{lbl}_fp][{lbl}_rp]")
+            px.append(f"[{lbl}_fp]{FRONT_EQ}[{lbl}_feq]")
+            px.append(f"[{lbl}_rp]{REAR_EQ}[{lbl}_req]")
+            # sin > 0 = front, sin < 0 = rear. Blend weights sum to 1.
+            px.append(f"[{lbl}_feq]volume='0.5+0.5*{sin_t}':eval=frame[{lbl}_fb]")
+            px.append(f"[{lbl}_req]volume='0.5-0.5*{sin_t}':eval=frame[{lbl}_rb]")
+            px.append(f"[{lbl}_fb][{lbl}_rb]amix=inputs=2:duration=first:normalize=0[{lbl}_m]")
+            src = f"[{lbl}_m]"
+        else:
+            src = f"[{lbl}_f]"
+
+        # 3. ILD panning — cos-based, NEVER fully silent (floor=0.12)
+        px.append(f"{src}asplit=2[{lbl}_Ls][{lbl}_Rs]")
+        if vocal_center:
+            half = round(FLOOR + depth * 0.5, 4)
+            vc_d = round(depth * 0.3, 4)
+            pan_L = f"({half}-{vc_d}*{cos_t})"
+            pan_R = f"({half}+{vc_d}*{cos_t})"
+        else:
+            pan_L = f"({FLOOR}+{depth}*(0.5-0.5*{cos_t}))"
+            pan_R = f"({FLOOR}+{depth}*(0.5+0.5*{cos_t}))"
+
+        px.append(f"[{lbl}_Ls]volume='{pan_L}':eval=frame[{lbl}_Lv]")
+        px.append(f"[{lbl}_Rs]volume='{pan_R}':eval=frame[{lbl}_Rv]")
+
+        # 4. ITD — simple single-channel delay on R
+        left_sig  = f"{lbl}_Lv"
+        right_sig = f"{lbl}_Rv"
+        if itd_ms > 0:
+            px.append(f"[{lbl}_Rv]adelay={itd_ms}|0[{lbl}_Rd]")
+            right_sig = f"{lbl}_Rd"
+
+        # 5. Mild head shadow on R for high bands ONLY
+        #    Gentle −3dB shelf above 9kHz — NOT a brick-wall lowpass
+        if hi > 2000 and p.hrtf_intensity > 0:
+            shadow = round(-3.0 * min(p.hrtf_intensity, 1.0), 1)
+            px.append(f"[{right_sig}]equalizer=f=9000:t=h:w=7000:g={shadow}[{lbl}_Rs2]")
+            right_sig = f"{lbl}_Rs2"
+
+        # 6. Join stereo + distance
+        px.append(f"[{left_sig}][{right_sig}]join=inputs=2:channel_layout=stereo[{lbl}_st]")
+        px.append(f"[{lbl}_st]volume={dvol}[{lbl}_out]")
+        return px
+
+    # ── Assemble 8 bands ──────────────────────────────────────────────────────
+    parts = [
+        "pan=mono|c0=0.5*c0+0.5*c1[mono_src]",
+        "[mono_src]asplit=8[sub_in][bass_in][lowm_in][voc_in][highm_in][pres_in][air_in][spark_in]",
+    ]
+
+    parts += band("sub",   20,    80,    r_sub,   ph=PHASE['sub'],   itd_ms=ITD_MS['sub'],   rear_eq=False)
+    parts += band("bass",  80,    250,   r_bass,  ph=PHASE['bass'],  itd_ms=ITD_MS['bass'],  rear_eq=False)
+    parts += band("lowm",  250,   600,   r_lowm,  ph=PHASE['lowm'],  itd_ms=ITD_MS['lowm'],  rear_eq=True)
+    parts += band("voc",   600,   2000,  r_voc,   ph=PHASE['voc'],   itd_ms=ITD_MS['voc'],
+                  rear_eq=False, vocal_center=True)  # no HF blur; always centred
+    parts += band("highm", 2000,  4000,  r_highm, ph=PHASE['highm'], itd_ms=ITD_MS['highm'], rear_eq=True)
+    parts += band("pres",  4000,  8000,  r_pres,  ph=PHASE['pres'],  itd_ms=ITD_MS['pres'],  rear_eq=True)
+    parts += band("air",   8000,  14000, r_air,   ph=PHASE['air'],   itd_ms=ITD_MS['air'],   rear_eq=True)
+    parts += band("spark", 14000, 22000, r_spark, ph=PHASE['spark'], itd_ms=ITD_MS['spark'],  rear_eq=True)
+
+    # ── Mix bands ─────────────────────────────────────────────────────────────
+    outs = "".join(f"[{b}_out]" for b in ["sub","bass","lowm","voc","highm","pres","air","spark"])
+    parts.append(f"{outs}amix=inputs=8:duration=first:normalize=0[mixed]")
+
+    # ── Reverb ────────────────────────────────────────────────────────────────
+    rev_wet = round(p.reverb_mix * 0.55, 3)
+    rev_dry = round(1.0 - rev_wet, 3)
+
+    parts.append("[mixed]asplit=2[dry][rev_in]")
+
+    # Allpass diffuser (early reflections)
+    r = max(0.05, min(1.0, p.reverb_room))
+    sc = r / 0.6
+    d1, d2 = max(5, int(17*sc)), max(7, int(23*sc))
+    d3, d4 = max(9, int(31*sc)), max(11, int(41*sc))
+    dc1 = round(min(0.25, 0.14*(1+r*0.3)), 3)
+    dc2 = round(min(0.20, 0.11*(1+r*0.3)), 3)
+    dc3 = round(min(0.16, 0.08*(1+r*0.3)), 3)
+    dc4 = round(min(0.13, 0.06*(1+r*0.3)), 3)
+    parts.append(f"[rev_in]aecho=in_gain=1.0:out_gain=1.0:delays={d1}|{d2}|{d3}|{d4}:decays={dc1}|{dc2}|{dc3}|{dc4}[diff]")
+
+    # Pre-delay
+    # Pre-delay: 25–40 ms — longer pre-delay dramatically increases
+    # perceived room size and separates dry source from reverb tail.
+    # Old range (15–33ms) was too short to feel like a real space.
+    pre_ms = round(25 + r * 15, 1)   # 25 ms (small room) → 40 ms (hall)
+    parts.append(f"[diff]adelay={pre_ms}|{pre_ms}[pre]")
+
+    # Main reverb tail
+    rd = p.reverb_density
+    if check_reverberate_filter():
+        rs  = int(r * 100)
+        dt  = int(rd * 4500)
+        dmp = round(1.0 - rd, 2)
+        parts.append(f"[pre]reverberate=room_size={rs}:time={dt}:damping={dmp:.2f}:wet={rev_wet:.3f}:dry=0[wet]")
+    else:
+        d1r = max(1, int(40*r));  d2r = max(1, int(70*r))
+        d3r = max(1, int(110*r)); d4r = max(1, int(160*r))
+        dc1r = round(rd*0.55,2); dc2r = round(rd*0.38,2)
+        dc3r = round(rd*0.24,2); dc4r = round(rd*0.14,2)
+        parts.append(
+            f"[pre]aecho=in_gain=0.85:out_gain={rev_wet:.3f}"
+            f":delays={d1r}|{d2r}|{d3r}|{d4r}"
+            f":decays={dc1r}|{dc2r}|{dc3r}|{dc4r}[wet]"
+        )
+
+    parts.append(f"[dry]volume={rev_dry:.3f}[dry_v]")
+    parts.append(f"[dry_v][wet]amix=inputs=2:duration=first:normalize=0[post_rev]")
+
+    # ── Mastering ─────────────────────────────────────────────────────────────
+    # M/S EQ — process mid (mono-sum) and side (stereo-diff) independently.
+    #
+    # Why: After multiband spatial processing the summed signal often has:
+    #   • Muddy low-mids (200-400 Hz) bleeding into the Side channel,
+    #     which smears the spatial image and reduces stereo clarity.
+    #   • Insufficient "air" in the Side channel, making the space feel
+    #     small and close compared to YouTube 8D references.
+    #
+    # This M/S EQ:
+    #   MID channel  — cut 300 Hz mud (masked by spatial processing),
+    #                  slight 2 kHz vocal presence restore
+    #   SIDE channel — hard cut below 180 Hz (bass must be mono-compatible),
+    #                  +2.5 dB air shelf at 10 kHz (expands perceived space)
+    #
+    # Implementation: FFmpeg has no per-channel EQ, so we split to M/S via pan,
+    # EQ each as a mono stream, then recombine.
+    parts.append(
+        # Encode L/R → M/S  (M = L+R / 2,  S = L-R / 2)
+        "[post_rev]asplit=2[ms_l][ms_r];"
+        "[ms_l]pan=1c|c0=0.5*c0+0.5*c1[mid_raw];"
+        "[ms_r]pan=1c|c0=0.5*c0-0.5*c1[side_raw];"
+        # MID: cut 300 Hz boxiness, +1.2 dB vocal presence at 2 kHz
+        "[mid_raw]"
+        "equalizer=f=300:t=q:w=250:g=-2.0,"
+        "equalizer=f=2000:t=q:w=1500:g=1.2"
+        "[mid_eq];"
+        # SIDE: highpass at 180 Hz (bass stays mono), +2.5 dB air
+        "[side_raw]"
+        "highpass=f=180:poles=2,"
+        "equalizer=f=10000:t=h:w=5000:g=2.5"
+        "[side_eq];"
+        # Decode M/S → L/R  (L = M+S,  R = M-S)
+        "[mid_eq][side_eq]join=inputs=2:channel_layout=stereo[ms_join];"
+        "[ms_join]pan=stereo|c0=c0+c1|c1=c0-c1[post_ms]"
+    )
+
+    # Stereo width
+    parts.append(f"[post_ms]stereotools=mlev={p.stereo_width:.3f}:softclip=1[wide]")
+
+    # User 12-band EQ (optional)
+    eq = _eq_chain(p)
+    if eq:
+        parts.append(f"[wide]{eq}[eqd]")
+        last = "eqd"
+    else:
+        last = "wide"
+
+    # Loudness normalisation (EBU R128)
+    parts.append(f"[{last}]loudnorm=I=-16:TP=-1.5:LRA=11:linear=true[loud]")
+    last = "loud"
+
+    # Elevation — only if non-zero
+    if abs(p.elevation) > 0.01:
+        eg_hi  = round(p.elevation * 6.0, 1)
+        eg_sub = round(-p.elevation * 2.5, 1)
+        parts.append(
+            f"[{last}]equalizer=f=8000:t=h:w=3000:g={eg_hi},"
+            f"equalizer=f=80:t=h:w=80:g={eg_sub}[elev]"
+        )
+        last = "elev"
+
+    # Limiter
+    if p.enable_limiter:
+        parts.append(f"[{last}]alimiter=limit=1:attack=5:release=50:level=false[8d_out]")
+        return ";".join(parts), "[8d_out]"
+
+    return ";".join(parts), f"[{last}]"
+
+
 
 def build_6band_filtergraph(p: ProcessingParams) -> tuple:
     i   = p.intensity_multiplier
@@ -1915,14 +3016,54 @@ def build_6band_filtergraph(p: ProcessingParams) -> tuple:
     # v6: add diffuse-field EQ
     dfeq = _diffuse_field_eq()
     parts.append(f"[{last}]{dfeq}[dfeq]")
-    parts.append("[dfeq]loudnorm=I=-16:TP=-1.5:LRA=11[normd]")
+    parts.append("[dfeq]loudnorm=I=-16:TP=-1.5:LRA=11[6b_loud]")
+    # v8.1 dual-band elevation (ported from 8-band engine)
+    elev_parts, last_node = _elevation_dual_band(p, "6b_loud")
+    parts.extend(elev_parts)
+    return ";".join(parts), f"[{last_node}]"
 
-    if abs(p.elevation) > 0.01:
-        eg = round(p.elevation * 6.0, 1)
-        parts.append(f"[normd]equalizer=f=8000:t=h:w=2000:g={eg}[out]")
-        return ";".join(parts), "[out]"
 
-    return ";".join(parts), "[normd]"
+# ============================================================================
+# SHARED HELPERS  — used by multiple engine builders
+# ============================================================================
+
+def _elevation_dual_band(p: ProcessingParams, node_in: str) -> tuple:
+    """
+    v8.1 dual-band elevation model — shared across ALL engine builders.
+
+    Old model (all legacy engines): single high-shelf at 8 kHz.
+      Problem: only boosts/cuts brightness; does nothing for the
+      psychoacoustic sub-bass cue that determines perceived height.
+
+    New model (ported from 8-band v8.1):
+      Elevation > 0 (above listener):
+        +HF shelf  at 8 kHz:  +6 dB × elevation  (bright, airy)
+        Sub cut    at 80 Hz:  -2.5 dB × elevation (less "floored")
+      Elevation < 0 (below listener):
+        -HF shelf  at 8 kHz:  mirrors above (darker, earthed)
+        Sub boost  at 80 Hz:  +2.5 dB × elevation (grounded rumble)
+
+    Arguments:
+      p        — ProcessingParams (reads p.elevation)
+      node_in  — the FFmpeg label string for the input node, e.g. "loud"
+
+    Returns (filter_parts: List[str], out_label: str)
+      Caller appends filter_parts to its own parts list and uses out_label
+      as the input to the next stage (limiter / final output).
+    """
+    if abs(p.elevation) <= 0.01:
+        return [], node_in  # nothing to do
+
+    eg_hi  = round(p.elevation * 6.0,  1)   # ±6 dB at 8 kHz
+    eg_sub = round(-p.elevation * 2.5, 1)   # opposite sign: above → sub cut
+    out_lbl = "elev_dual"
+    filt = (
+        f"[{node_in}]"
+        f"equalizer=f=8000:t=h:w=3000:g={eg_hi},"
+        f"equalizer=f=80:t=h:w=80:g={eg_sub}"
+        f"[{out_lbl}]"
+    )
+    return [filt], out_lbl
 
 
 # ============================================================================
@@ -1948,14 +3089,15 @@ def build_simple_filtergraph(p: ProcessingParams) -> tuple:
         f"[rev]stereotools=mlev={p.stereo_width}[wide]",
     ]
     if eq:
-        parts += [f"[wide]{eq}[eqd]", "[eqd]loudnorm=I=-16:TP=-1.5:LRA=11[out]"]
+        parts += [f"[wide]{eq}[eqd]", "[eqd]loudnorm=I=-16:TP=-1.5:LRA=11[simple_loud]"]
+        loud_node = "simple_loud"
     else:
-        parts.append("[wide]loudnorm=I=-16:TP=-1.5:LRA=11[out]")
-    if abs(p.elevation) > 0.01:
-        eg = round(p.elevation * 6, 1)
-        parts.append(f"[out]equalizer=f=8000:t=h:w=2000:g={eg}[elev_out]")
-        return ";".join(parts), "[elev_out]"
-    return ";".join(parts), "[out]"
+        parts.append("[wide]loudnorm=I=-16:TP=-1.5:LRA=11[simple_loud]")
+        loud_node = "simple_loud"
+    # v8.1 dual-band elevation (ported from 8-band engine)
+    elev_parts, last_node = _elevation_dual_band(p, loud_node)
+    parts.extend(elev_parts)
+    return ";".join(parts), f"[{last_node}]"
 
 
 def build_vocal_aware_filtergraph(p: ProcessingParams) -> tuple:
@@ -2022,14 +3164,15 @@ def build_vocal_aware_filtergraph(p: ProcessingParams) -> tuple:
         f"[rev]stereotools=mlev={p.stereo_width}[wide]",
     ]
     if eq:
-        parts += [f"[wide]{eq}[eqd]", "[eqd]loudnorm=I=-16:TP=-1.5:LRA=11[out]"]
+        parts += [f"[wide]{eq}[eqd]", "[eqd]loudnorm=I=-16:TP=-1.5:LRA=11[voc_loud]"]
+        loud_node = "voc_loud"
     else:
-        parts.append("[wide]loudnorm=I=-16:TP=-1.5:LRA=11[out]")
-    if abs(p.elevation) > 0.01:
-        eg = round(p.elevation * 6, 1)
-        parts.append(f"[out]equalizer=f=8000:t=h:w=2000:g={eg}[elev_out]")
-        return ";".join(parts), "[elev_out]"
-    return ";".join(parts), "[out]"
+        parts.append("[wide]loudnorm=I=-16:TP=-1.5:LRA=11[voc_loud]")
+        loud_node = "voc_loud"
+    # v8.1 dual-band elevation (ported from 8-band engine)
+    elev_parts, last_node = _elevation_dual_band(p, loud_node)
+    parts.extend(elev_parts)
+    return ";".join(parts), f"[{last_node}]"
 
 
 # ============================================================================
@@ -2483,6 +3626,7 @@ async def separate_stems(
             return None
 
         stem_sessions[session_id] = stems
+        _session_timestamps[session_id] = __import__('time').time()  # TTL clock
         print(f"✅ Stems [{use_model}]: {list(stems.keys())} → session {session_id}")
         await manager.send_progress(
             job_id, 18,
@@ -2693,7 +3837,10 @@ async def process_8d_audio(
                 print(f"  ↳ Graph  : {len(fg)} chars across {n_stems} HRTF instances")
 
                 # Codec for final output
+                actual_sr = params.sample_rate or 48000
                 if params.output_format == "mp3":
+                    if actual_sr > 48000:
+                        actual_sr = 48000
                     final_codec = ["-c:a", "libmp3lame", "-b:a", f"{params.bitrate}k"]
                 elif params.output_format == "flac":
                     final_codec = ["-c:a", "flac", "-compression_level", "8"]
@@ -2710,7 +3857,7 @@ async def process_8d_audio(
                     *ff_inputs,
                     "-filter_complex", fg,
                     "-map", out_lbl,
-                    "-ar", str(params.sample_rate),
+                    "-ar", str(actual_sr),
                     *final_codec,
                     output_file,
                 ]
@@ -2726,7 +3873,7 @@ async def process_8d_audio(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stderr_lines: List[str] = []
+                _active_procs[job_id] = proc   # register for cancel endpoint
                 while True:
                     line = await proc.stderr.readline()
                     if not line:
@@ -2782,8 +3929,84 @@ async def process_8d_audio(
             filtergraph, out_label = build_atmos_71_4_filtergraph(params)
             engine_name = "Dolby Atmos Bed (7.1.4)"
         elif params.enable_multi_band and params.enable_hrtf:
-            filtergraph, out_label = build_8band_hrtf_engine_v6(params)
-            engine_name = "Studio Grade v6.0 (8-band HRTF + ITD + Pinna EQ + Diffuse-Field)"
+            # Extract beat positions from analysis for beat-locked rotation
+            beat_times_s: Optional[List[float]] = None
+            if audio_analysis and ADVANCED_ANALYSIS:
+                raw_beats = audio_analysis.get('beat_positions', [])
+                sr_val    = audio_analysis.get('sample_rate', 48000)
+                if raw_beats and sr_val:
+                    try:
+                        beat_times_s = [float(b) / sr_val for b in raw_beats]
+                    except Exception:
+                        beat_times_s = None
+
+            # ── HRIR pre-pass ──────────────────────────────────────────────
+            hrir_input = input_file
+            hrir_temp  = None
+            fg_params  = params   # default: unmodified params for FFmpeg stage
+            if ADVANCED_ANALYSIS and params.enable_hrtf:
+                try:
+                    await manager.send_progress(
+                        job_id, 18, "🧠 HRIR binaural convolution pass…"
+                    )
+                    y_raw, sr_raw = librosa.load(input_file, sr=None, mono=True)
+                    target_sr = params.sample_rate or 48000
+                    if sr_raw != target_sr:
+                        y_raw = librosa.resample(y_raw, orig_sr=sr_raw, target_sr=target_sr)
+                        sr_raw = target_sr
+
+                    hrir_eng  = get_hrir_engine(sr_raw)
+                    stereo_np = hrir_eng.render(
+                        y_raw,
+                        beat_times_s=beat_times_s,
+                        rotation_speed=params.rotation_speed * params.intensity_multiplier,
+                        elevation=params.elevation,
+                        distance_m=params.distance,   # maps 0.2–1.1 m into SOFA range
+                    )
+                    # Write pre-rendered binaural WAV
+                    hrir_temp = str(TEMP_DIR / f"{job_id}_hrir.wav")
+                    sf.write(hrir_temp, stereo_np.T, sr_raw, subtype='PCM_24')
+                    hrir_input = hrir_temp
+                    print(f"  ↳ HRIR pre-pass complete → {Path(hrir_temp).name}")
+                    await manager.send_progress(
+                        job_id, 22, "✅ HRIR pass done — applying reverb + EQ…"
+                    )
+                except Exception as hrir_err:
+                    print(f"  ⚠  HRIR pass failed ({hrir_err}), falling back to FFmpeg HRTF")
+                    import traceback; traceback.print_exc()
+                    hrir_temp = None
+                    hrir_input = input_file
+
+            # Build FFmpeg filtergraph
+            # When hrir_input is the HRIR-pre-rendered WAV, we suppress the
+            # FFmpeg HRTF stage (pan rotation) and only apply reverb + EQ.
+            # The elevation is handled in the HRIR engine, so we zero it here.
+            fg_params = params
+            if hrir_temp:
+                # HRIR engine already applied rotation + elevation + ITD + pinna
+                # FFmpeg stage: reverb, EQ, loudnorm, limiter only.
+                # We use the 6-band engine with rotation zeroed out to get
+                # just the mastering chain without spatial movement.
+                fg_params = params.copy(update={
+                    "rotation_speed": 0.0,
+                    "bass_rotation":  0.0,
+                    "treble_rotation": 0.0,
+                    "elevation": 0.0,
+                    "enable_hrtf": False,   # skip FFmpeg HRTF layer
+                    "enable_multi_band": False,
+                })
+                filtergraph, out_label = build_stereo_mastering_chain(fg_params)
+                engine_name = (
+                    "Studio Grade v9.0 — HRIR Convolution + Stereo Mastering"
+                )
+            else:
+                filtergraph, out_label = build_8band_hrtf_engine_v6(
+                    params, beat_times_s=beat_times_s
+                )
+                engine_name = "Studio Grade v9.0 (8-band HRTF + Beat-Locked Rotation)"
+
+            # Use HRIR pre-rendered temp file as input if available
+            input_file_for_ffmpeg = hrir_input
         elif params.enable_multi_band:
             filtergraph, out_label = build_6band_filtergraph(params)
             engine_name = "6-band multiband engine"
@@ -2798,32 +4021,38 @@ async def process_8d_audio(
         print(f"  ↳ Graph  : {len(filtergraph)} chars")
         await manager.send_progress(job_id, 25, f"Using {engine_name}…")
 
+        actual_sr = params.sample_rate or 48000
         if params.output_format == "mp3":
+            if actual_sr > 48000:
+                actual_sr = 48000
             codec = ["-c:a", "libmp3lame", "-b:a", f"{params.bitrate}k"]
         elif params.output_format == "flac":
             codec = ["-c:a", "flac", "-compression_level", "8"]
         else:
             codec = ["-c:a", "pcm_s24le"]
 
+        # Use HRIR pre-rendered WAV if available, else original input
+        _ffmpeg_input = input_file_for_ffmpeg if 'input_file_for_ffmpeg' in locals() else input_file
+
         cmd = [
             "ffmpeg", "-y",
-            "-i", input_file,
+            "-i", _ffmpeg_input,
             "-filter_complex", filtergraph,
             "-map", out_label,
-            "-ar", str(params.sample_rate),
+            "-ar", str(actual_sr),
             *codec,
             output_file
         ]
 
         await manager.send_progress(job_id, 35, "Applying binaural ITD + panning…")
-        total_dur = get_audio_duration(input_file)
+        total_dur = get_audio_duration(_ffmpeg_input)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-
+        _active_procs[job_id] = proc   # register for cancel endpoint
         stderr_lines = []
         while True:
             line = await proc.stderr.readline()
@@ -2848,6 +4077,14 @@ async def process_8d_audio(
         if not os.path.exists(output_file):
             raise Exception("Output file was not created")
 
+        # Clean up HRIR temp file
+        _hrir_temp_ref = locals().get('hrir_temp')
+        if _hrir_temp_ref and os.path.exists(_hrir_temp_ref):
+            try:
+                os.unlink(_hrir_temp_ref)
+            except Exception:
+                pass
+
         video_url = None
         if params.generate_video:
             vid_out = str(OUTPUT_DIR / (Path(output_file).stem + "_viz.mp4"))
@@ -2859,10 +4096,22 @@ async def process_8d_audio(
         out_url = f"http://localhost:8000/download/{Path(output_file).name}"
         await manager.send_complete(job_id, out_url, video_url=video_url)
         print(f"✅ Done → {out_url}")
+        _active_procs.pop(job_id, None)
+        _active_tasks.pop(job_id, None)
         return True
+
+    except asyncio.CancelledError:
+        # Job was cancelled via the DELETE /process/{job_id} endpoint
+        print(f"⛔ Job {job_id} cancelled by user")
+        _active_procs.pop(job_id, None)
+        _active_tasks.pop(job_id, None)
+        await manager.send_error(job_id, "Processing cancelled by user")
+        return False
 
     except Exception as e:
         print(f"❌ Processing error: {e}")
+        _active_procs.pop(job_id, None)
+        _active_tasks.pop(job_id, None)
         await manager.send_error(job_id, str(e))
         return False
 
@@ -2873,30 +4122,51 @@ async def process_8d_audio(
 
 @app.get("/health")
 async def health():
-    ok = check_ffmpeg()
+    ok      = check_ffmpeg()
     has_rev = check_reverberate_filter() if ok else False
+
+    # Explicit variables so the values are readable in logs/tests
+    stem_ok  = STEM_SEPARATION   # True when demucs or spleeter is available
+    stem_eng = STEM_ENGINE        # "demucs" | "spleeter" | "none"
+
+    # Report whether real KEMAR HRIR data is loaded
+    engine = get_hrir_engine()
+    sofa_loaded = getattr(engine, "using_sofa", False)
+
     return {
-        "status":            "healthy" if ok else "degraded",
-        "ffmpeg":            ok,
-        "advanced_analysis": ADVANCED_ANALYSIS,
-        "youtube_support":   YOUTUBE_SUPPORT,
-        "stem_separation":   STEM_SEPARATION,
-        "stem_engine":       STEM_ENGINE,
-        "reverb_engine":     "reverberate" if has_rev else "aecho",
-        "has_reverberate":   has_rev,
-        "version":           "7.0.0",
-        "analysis_bands":    10,
-        "eq_bands":          12,
-        "spatial_bands":     8,
-        "genres":            15,
-        "itd_simulation":    True,
-        "pinna_notch_eq":    True,
-        "diffuse_field_eq":  True,
-        "allpass_diffusion": True,
-        "ambisonics_foa":    True,
-        "atmos_71_4":        True,
-        "video_visualizer":  True,
+        "status":               "healthy" if ok else "degraded",
+        "ffmpeg":               ok,
+        "advanced_analysis":    ADVANCED_ANALYSIS,
+        "youtube_support":      YOUTUBE_SUPPORT,
+        "stem_separation":      stem_ok,   # ← True when demucs/spleeter installed
+        "stem_engine":          stem_eng,  # ← "demucs" when Demucs 4.x present
+        "reverb_engine":        "reverberate" if has_rev else "aecho",
+        "has_reverberate":      has_rev,
+        "version":              "9.1.0",
+        "analysis_bands":       10,
+        "eq_bands":             12,
+        "spatial_bands":        8,
+        "genres":               15,
+        "itd_simulation":       True,
+        "pinna_notch_eq":       True,
+        "diffuse_field_eq":     True,
+        "allpass_diffusion":    True,
+        "ambisonics_foa":       True,
+        "atmos_71_4":           True,
+        "video_visualizer":     True,
+        "hrir_convolution":     ADVANCED_ANALYSIS,
+        "hrir_source":          "KEMAR_SOFA" if sofa_loaded else "synthetic",
+        "beat_locked_rotation": ADVANCED_ANALYSIS,
+        "dual_band_elevation":  True,
+        "ms_eq":                True,   # M/S EQ on master bus
+        "pre_delay_ms":         "25-40",
     }
+
+@app.get("/presets")
+async def list_presets():
+    """Return the full preset library for the frontend dropdown."""
+    return {"presets": PresetLibrary.get_preset_list()}
+
 
 @app.post("/analyze")
 async def analyze_audio(file: UploadFile = File(...)):
@@ -2906,6 +4176,14 @@ async def analyze_audio(file: UploadFile = File(...)):
         path.write_bytes(await file.read())
         result = audio_analyzer.analyze_comprehensive(str(path))
         path.unlink(missing_ok=True)
+
+        # Attach preset suggestions
+        if ADVANCED_ANALYSIS:
+            rec = PresetLibrary.select_preset(result)
+            result['available_presets']    = PresetLibrary.get_preset_list()
+            result['recommended_preset']   = rec
+            result['recommended_preset_id'] = result.get('genre', 'pop')
+
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2916,7 +4194,7 @@ async def process_audio(
     params: str = Form(...)
 ):
     try:
-        pp = ProcessingParams(**json.loads(params))
+        pp = ProcessingParams.model_validate(json.loads(params))
         job_id = str(uuid.uuid4())
 
         if audio_file:
@@ -2924,6 +4202,12 @@ async def process_audio(
             in_path.write_bytes(await audio_file.read())
         else:
             raise HTTPException(status_code=400, detail="No audio file provided")
+
+        # Apply genre preset if preset_id matches a known genre
+        if pp.preset_id and pp.preset_id in PresetLibrary.GENRE_PRESETS:
+            preset_data = PresetLibrary.GENRE_PRESETS[pp.preset_id]
+            pp = ProcessingParams.apply_preset(pp, preset_data)
+            print(f"  ↳ Preset applied: {pp.preset_id} → {preset_data['name']}")
 
         # Determine file extension based on format
         ext_map = {
@@ -2934,16 +4218,49 @@ async def process_audio(
         out_name = f"{job_id}_8d.{ext}"
         out_path  = OUTPUT_DIR / out_name
 
-        asyncio.create_task(
+        task = asyncio.create_task(
             process_8d_audio(str(in_path), str(out_path), pp, job_id, None)
         )
+        _active_tasks[job_id] = task
         return {"job_id": job_id, "status": "processing"}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/stems/separate")
+@app.delete("/process/{job_id}")
+async def cancel_job(job_id: str):
+    """
+    Cancel an in-flight processing job.
+
+    Terminates the FFmpeg subprocess (if still running) and cancels the
+    asyncio task.  The WebSocket client will receive an error message so
+    the UI can update accordingly.
+    """
+    cancelled_anything = False
+
+    # 1. Kill the FFmpeg subprocess
+    proc = _active_procs.get(job_id)
+    if proc and proc.returncode is None:
+        try:
+            proc.terminate()
+            await asyncio.sleep(0.5)
+            if proc.returncode is None:
+                proc.kill()   # force-kill if SIGTERM wasn't enough
+        except Exception:
+            pass
+        cancelled_anything = True
+
+    # 2. Cancel the asyncio task (raises CancelledError inside process_8d_audio)
+    task = _active_tasks.get(job_id)
+    if task and not task.done():
+        task.cancel()
+        cancelled_anything = True
+
+    if not cancelled_anything:
+        raise HTTPException(status_code=404, detail="Job not found or already complete")
+
+    return {"job_id": job_id, "status": "cancelled"}
 async def stems_separate(
     audio_file: UploadFile = File(...),
     model: str = Form("htdemucs"),  # htdemucs | htdemucs_6s | spleeter
@@ -3022,6 +4339,7 @@ async def batch_process(
         batch_id   = str(uuid.uuid4())
         params_obj = ProcessingParams(**json.loads(params))
         batch_queue[batch_id] = []
+        _session_timestamps[batch_id] = __import__('time').time()  # TTL clock
 
         for file in files:
             job_id     = str(uuid.uuid4())
@@ -3130,6 +4448,7 @@ if __name__ == "__main__":
     print(f"                      6-stem Demucs htdemucs_6s support")
     print(f"                      _prefix_filtergraph multi-instance engine")
     print(f"  Advanced analysis : {'✅' if ADVANCED_ANALYSIS else '❌  pip install librosa soundfile scipy'}")
+    print(f"  SOFA/HRTF dataset : {'✅  h5py available' if H5PY_AVAILABLE else '❌  pip install h5py'}")
     print(f"  YouTube support   : {'✅' if YOUTUBE_SUPPORT else '❌  pip install yt-dlp'}")
     print(f"  Stem separation   : {'✅  ' + STEM_ENGINE if STEM_SEPARATION else '❌  pip install demucs'}")
 
