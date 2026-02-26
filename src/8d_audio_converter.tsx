@@ -458,10 +458,10 @@ const SectionDivider = ({ label }) => (
 const EQVisualizer = ({ bands }) => {
   const maxGain = 14;
   return (
-    <div className="meridian-eq-container">
+    <div className="meridian-eq-container" style={{ height: 88 }}>
       <div className="meridian-eq-zero" />
       {bands.map(({ freq, gain }) => {
-        const barH = Math.abs(gain / maxGain) * 32;
+        const barH = Math.abs(gain / maxGain) * 28;
         return (
           <div key={freq} className="meridian-eq-col">
             {gain >= 0 ? (
@@ -469,6 +469,18 @@ const EQVisualizer = ({ bands }) => {
             ) : (
               <div className="meridian-eq-bar-neg" style={{ height: barH }} />
             )}
+            <span style={{
+              position: 'absolute',
+              bottom: 2,
+              fontSize: 7,
+              fontFamily: "'Fragment Mono', monospace",
+              color: '#7A7060',
+              letterSpacing: '-0.02em',
+              whiteSpace: 'nowrap',
+              userSelect: 'none',
+            }}>
+              {freq}
+            </span>
           </div>
         );
       })}
@@ -739,8 +751,12 @@ const AudioConverter = () => {
   // Guitar/Piano (6-stem model)
   const [stemGuitarRotation, setStemGuitarRotation] = useState(null);
   const [stemGuitarWidth, setStemGuitarWidth] = useState(null);
+  const [stemGuitarElevation, setStemGuitarElevation] = useState(null);
+  const [stemGuitarReverb, setStemGuitarReverb] = useState(null);
   const [stemPianoRotation, setStemPianoRotation] = useState(null);
   const [stemPianoWidth, setStemPianoWidth] = useState(null);
+  const [stemPianoElevation, setStemPianoElevation] = useState(null);
+  const [stemPianoReverb, setStemPianoReverb] = useState(null);
   const [stemModel, setStemModel] = useState('htdemucs');
 
   // Video Visualizer
@@ -758,21 +774,24 @@ const AudioConverter = () => {
     stem_engine: 'none',
     ambisonics_foa: false,
     atmos_71_4: false,
-    video_visualizer: false
+    video_visualizer: false,
+    hrir_convolution: false,
+    beat_locked_rotation: false,
+    dual_band_elevation: false,
   });
 
   // 12-band EQ
-  const [eqSub30Gain, setEqSub30Gain] = useState(3.0);
-  const [eqSub60Gain, setEqSub60Gain] = useState(4.0);
-  const [eqBass100Gain, setEqBass100Gain] = useState(3.0);
-  const [eqUbass200Gain, setEqUbass200Gain] = useState(1.5);
+  const [eqSub30Gain, setEqSub30Gain] = useState(7.0);
+  const [eqSub60Gain, setEqSub60Gain] = useState(8.0);
+  const [eqBass100Gain, setEqBass100Gain] = useState(5.0);
+  const [eqUbass200Gain, setEqUbass200Gain] = useState(2.5);
   const [eqLowmid350Gain, setEqLowmid350Gain] = useState(-2.5);
-  const [eqMid700Gain, setEqMid700Gain] = useState(-1.0);
-  const [eqUmid1500Gain, setEqUmid1500Gain] = useState(1.0);
-  const [eqPresence3kGain, setEqPresence3kGain] = useState(2.0);
-  const [eqDef5kGain, setEqDef5kGain] = useState(1.5);
-  const [eqBril8kGain, setEqBril8kGain] = useState(2.0);
-  const [eqAir12kGain, setEqAir12kGain] = useState(2.0);
+  const [eqMid700Gain, setEqMid700Gain] = useState(-0.5);
+  const [eqUmid1500Gain, setEqUmid1500Gain] = useState(2.0);
+  const [eqPresence3kGain, setEqPresence3kGain] = useState(3.5);
+  const [eqDef5kGain, setEqDef5kGain] = useState(2.5);
+  const [eqBril8kGain, setEqBril8kGain] = useState(3.0);
+  const [eqAir12kGain, setEqAir12kGain] = useState(5.0);
   const [eqUair16kGain, setEqUair16kGain] = useState(1.0);
 
   // Enhancement toggles
@@ -783,10 +802,28 @@ const AudioConverter = () => {
   // Studio controls
   const [reverbDensity, setReverbDensity] = useState(0.7);
   const [hrtfIntensity, setHrtfIntensity] = useState(1.0);
+  const [intensityMultiplier, setIntensityMultiplier] = useState(1.0);
+  const [enableLimiter, setEnableLimiter] = useState(true);
+
+  // Preset library state
+  const [selectedPreset, setSelectedPreset] = useState<string>('auto');
+  const [availablePresets, setAvailablePresets] = useState<any[]>([]);
+  const [autoPresetApplied, setAutoPresetApplied] = useState(false);
+  const [presetDescription, setPresetDescription] = useState('');
+
+  // Stem engine toggles
+  const [stemAutoRoute, setStemAutoRoute] = useState(true);
+  const [enableGainStaging, setEnableGainStaging] = useState(true);
+  const [stemTargetLufs, setStemTargetLufs] = useState(-23.0);
+  const [enableMultibandMaster, setEnableMultibandMaster] = useState(true);
+
+  // Output quality
+  const [sampleRate, setSampleRate] = useState(48000);
 
   const fileInputRef = useRef(null);
   const batchFileInputRef = useRef(null);
   const audioElementRef = useRef(null);
+  const currentJobIdRef = useRef<string | null>(null);  // tracks active job for cancel
   const [isDragging, setIsDragging] = useState(false);
 
   useEffect(() => {
@@ -833,6 +870,9 @@ const AudioConverter = () => {
           ambisonics_foa: d.ambisonics_foa || false,
           atmos_71_4: d.atmos_71_4 || false,
           video_visualizer: d.video_visualizer || false,
+          hrir_convolution: d.hrir_convolution || false,
+          beat_locked_rotation: d.beat_locked_rotation || false,
+          dual_band_elevation: d.dual_band_elevation || false,
         });
       } else {
         setBackendStatus('error');
@@ -920,8 +960,9 @@ const AudioConverter = () => {
       enable_hrtf: true,
       enable_convolution_reverb: true,
       enable_multi_band: true,
-      sample_rate: 48000,
+      sample_rate: sampleRate,
       bit_depth: 24,
+      intensity_multiplier: intensityMultiplier,
       enable_vocal_center: enableVocalCenter,
       vocal_safe_bass: vocalSafeBass,
       instrument_enhance: instrumentEnhance,
@@ -944,10 +985,13 @@ const AudioConverter = () => {
       eq_air_gain: 0,
       reverb_density: reverbDensity,
       hrtf_intensity: hrtfIntensity,
-      enable_limiter: true,
+      enable_limiter: enableLimiter,
       enable_stem_separation: enableStemSeparation,
-      stem_engine_model: stemModel,  // BUG FIX: was "stem_model" — backend field is "stem_engine_model";
-                                     // Pydantic silently dropped the unknown key so htdemucs_6s was never used
+      stem_engine_model: stemModel,
+      stem_auto_route: stemAutoRoute,
+      enable_gain_staging: enableGainStaging,
+      stem_target_lufs: stemTargetLufs,
+      enable_multiband_master: enableMultibandMaster,
       stem_vocals_rotation: svr,
       stem_drums_rotation: sdr,
       stem_bass_rotation_override: sbr,
@@ -970,12 +1014,18 @@ const AudioConverter = () => {
       // Guitar/Piano (6-stem model)
       stem_guitar_rotation: stemGuitarRotation,
       stem_guitar_width: stemGuitarWidth,
+      stem_guitar_elevation: stemGuitarElevation,
+      stem_guitar_reverb: stemGuitarReverb,
       stem_piano_rotation: stemPianoRotation,
       stem_piano_width: stemPianoWidth,
+      stem_piano_elevation: stemPianoElevation,
+      stem_piano_reverb: stemPianoReverb,
       generate_video: generateVideo,
       video_style: videoStyle,
       video_resolution: videoResolution,
       video_fps: 25,
+      // Preset — sent so backend can log/apply server-side if preset_id is a genre
+      preset_id: selectedPreset !== 'auto' ? selectedPreset : null,
     };
   };
 
@@ -1040,7 +1090,17 @@ const AudioConverter = () => {
       if (r.ok) {
         const d = await r.json();
         setAudioAnalysis(d);
-        if (d.recommended_settings) applyRecommendedSettings(d.recommended_settings);
+        // Load available presets from backend
+        if (d.available_presets) setAvailablePresets(d.available_presets);
+        // In auto mode, auto-apply the recommended preset
+        if (selectedPreset === 'auto' && d.recommended_preset) {
+          applyRecommendedSettings(d.recommended_preset);
+          setAutoPresetApplied(true);
+          const recName = d.recommended_preset.name || d.recommended_preset_id || 'Optimal';
+          setPresetDescription(`✨ Auto-selected: ${recName}`);
+        } else if (d.recommended_settings) {
+          applyRecommendedSettings(d.recommended_settings);
+        }
       }
     } catch {}
   };
@@ -1102,6 +1162,7 @@ const AudioConverter = () => {
       const r = await fetch('http://localhost:8000/process', { method: 'POST', body: fd });
       if (r.ok) {
         const d = await r.json();
+        currentJobIdRef.current = d.job_id;   // store for cancel
         connectWebSocket(d.job_id);
       } else {
         alert('Processing failed. Check backend logs.');
@@ -1113,26 +1174,79 @@ const AudioConverter = () => {
     }
   };
 
-  const applyPreset = (preset) => {
-    const presets = {
-      subtle: { rotation: 0.08, reverb: 0.3, mix: 0.2, bass: 0.05, treble: 0.12, width: 0.8, elevation: 0, distance: 1.0, density: 0.6, hrtf: 0.7 },
-      classic: { rotation: 0.15, reverb: 0.6, mix: 0.3, bass: 0.08, treble: 0.2, width: 1.0, elevation: 0, distance: 1.0, density: 0.7, hrtf: 1.0 },
-      intense: { rotation: 0.3, reverb: 0.8, mix: 0.4, bass: 0.15, treble: 0.4, width: 1.2, elevation: 0.1, distance: 0.8, density: 0.85, hrtf: 1.2 },
-      cinematic: { rotation: 0.12, reverb: 0.85, mix: 0.45, bass: 0.06, treble: 0.18, width: 1.3, elevation: 0.15, distance: 1.2, density: 0.9, hrtf: 1.1 },
-      experimental: { rotation: 0.5, reverb: 0.9, mix: 0.5, bass: 0.25, treble: 0.6, width: 1.5, elevation: 0.2, distance: 0.6, density: 0.95, hrtf: 1.5 },
+  const cancelProcessing = async () => {
+    const jobId = currentJobIdRef.current;
+    if (!jobId) return;
+    // Close WebSocket immediately so we don't receive stale messages
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    try {
+      await fetch(`http://localhost:8000/process/${jobId}`, { method: 'DELETE' });
+    } catch {
+      // Best-effort — backend may already have finished
+    }
+    currentJobIdRef.current = null;
+    setIsProcessing(false);
+    setProgress(0);
+    setProcessingStage('Cancelled');
+  };
+
+  const applyPreset = (presetId: string, presetData?: any) => {
+    if (presetId === 'auto') {
+      setSelectedPreset('auto');
+      setPresetDescription('🤖 Will auto-detect optimal settings after analysis');
+      setAutoPresetApplied(false);
+      return;
+    }
+    // Built-in quick-fire presets
+    const quickPresets: Record<string, any> = {
+      subtle:       { rotation: 0.08, reverb: 0.3,  mix: 0.2,  bass: 0.05, treble: 0.12, width: 0.8,  elevation: 0,    distance: 1.0, density: 0.6,  hrtf: 0.7,  eq_sub30: 5.0, eq_sub60: 6.0, eq_air12k: 3.0, enable_vocal_center: true },
+      classic:      { rotation: 0.15, reverb: 0.6,  mix: 0.3,  bass: 0.08, treble: 0.2,  width: 1.0,  elevation: 0,    distance: 1.0, density: 0.7,  hrtf: 1.0,  eq_sub30: 7.0, eq_sub60: 8.0, eq_air12k: 5.0, enable_vocal_center: true },
+      intense:      { rotation: 0.25, reverb: 0.8,  mix: 0.4,  bass: 0.12, treble: 0.35, width: 1.3,  elevation: 0.1,  distance: 0.8, density: 0.85, hrtf: 1.2,  eq_sub30: 9.0, eq_sub60: 10.0, eq_air12k: 6.0, enable_vocal_center: false },
+      cinematic:    { rotation: 0.12, reverb: 0.85, mix: 0.45, bass: 0.06, treble: 0.18, width: 1.3,  elevation: 0.15, distance: 1.2, density: 0.9,  hrtf: 1.1,  eq_sub30: 6.0, eq_sub60: 7.0,  eq_air12k: 4.0, enable_vocal_center: true },
+      experimental: { rotation: 0.5,  reverb: 0.9,  mix: 0.5,  bass: 0.25, treble: 0.6,  width: 1.5,  elevation: 0.2,  distance: 0.6, density: 0.95, hrtf: 1.5,  eq_sub30: 8.0, eq_sub60: 9.0,  eq_air12k: 5.0, enable_vocal_center: false },
+      youtube_8d:   { rotation: 0.18, reverb: 0.55, mix: 0.25, bass: 0.06, treble: 0.28, width: 1.25, elevation: 0.05, distance: 1.0, density: 0.7,  hrtf: 1.0,  eq_sub30: 8.0, eq_sub60: 9.0,  eq_bass100: 6.0, eq_air12k: 5.0, enable_vocal_center: true, instrument_enhance: true, vocal_safe_bass: true },
+      // Genre presets (subset mirroring backend)
+      electronic:   { rotation: 0.22, reverb: 0.65, mix: 0.28, bass: 0.10, treble: 0.35, width: 1.35, elevation: 0.05, distance: 0.9, density: 0.75, hrtf: 1.1,  eq_sub30: 6.0, eq_sub60: 7.5, eq_bass100: 5.0, eq_lowmid350: -3.5, eq_mid700: -1.5, eq_presence3k: 3.0, eq_bril8k: 3.5, eq_air12k: 4.5, enable_vocal_center: false, instrument_enhance: true, intensity: 1.15 },
+      rock:         { rotation: 0.19, reverb: 0.55, mix: 0.30, bass: 0.11, treble: 0.32, width: 1.20, elevation: 0,    distance: 1.0, density: 0.70, hrtf: 1.0,  eq_sub30: 4.0, eq_sub60: 5.0, eq_bass100: 5.5, eq_lowmid350: -3.5, eq_mid700: -2.0, eq_presence3k: 4.5, eq_bril8k: 3.0, enable_vocal_center: true, instrument_enhance: true, intensity: 1.1 },
+      hip_hop:      { rotation: 0.13, reverb: 0.50, mix: 0.25, bass: 0.06, treble: 0.20, width: 1.15, elevation: -0.08,distance: 0.85,density: 0.65, hrtf: 0.9,  eq_sub30: 8.5, eq_sub60: 9.5, eq_bass100: 6.5, eq_lowmid350: -4.5, eq_mid700: -2.5, eq_presence3k: 2.0, eq_bril8k: 2.0, eq_air12k: 2.5, enable_vocal_center: true, instrument_enhance: true },
+      classical:    { rotation: 0.10, reverb: 0.90, mix: 0.55, bass: 0.05, treble: 0.16, width: 1.35, elevation: 0.15, distance: 1.4, density: 0.92, hrtf: 1.15, eq_sub30: 1.0, eq_sub60: 1.5, eq_bass100: 2.0, eq_lowmid350: -1.0, eq_mid700: 0.5, eq_presence3k: 3.5, eq_bril8k: 3.0, eq_air12k: 4.0, enable_vocal_center: false, intensity: 0.95 },
+      pop:          { rotation: 0.17, reverb: 0.62, mix: 0.32, bass: 0.08, treble: 0.28, width: 1.20, elevation: 0,    distance: 1.0, density: 0.72, hrtf: 1.0,  eq_sub30: 4.5, eq_sub60: 5.5, eq_bass100: 4.5, eq_lowmid350: -2.5, eq_mid700: -0.5, eq_presence3k: 3.5, eq_bril8k: 3.0, eq_air12k: 4.0, enable_vocal_center: true, instrument_enhance: true },
+      jazz:         { rotation: 0.15, reverb: 0.70, mix: 0.40, bass: 0.07, treble: 0.24, width: 1.15, elevation: 0,    distance: 1.0, density: 0.75, hrtf: 1.0,  eq_sub30: 2.5, eq_sub60: 3.5, eq_bass100: 3.0, eq_lowmid350: -1.5, eq_mid700: 0.0, eq_presence3k: 2.5, eq_bril8k: 2.5, eq_air12k: 3.0, enable_vocal_center: false },
+      ambient:      { rotation: 0.07, reverb: 0.95, mix: 0.65, bass: 0.03, treble: 0.11, width: 1.50, elevation: 0.18, distance: 1.6, density: 0.95, hrtf: 1.25, eq_sub30: 1.5, eq_sub60: 2.5, eq_bass100: 2.0, eq_lowmid350: -1.0, eq_mid700: 0.0, eq_presence3k: 2.0, eq_bril8k: 3.0, eq_air12k: 5.5, enable_vocal_center: false, intensity: 0.9 },
+      bollywood:    { rotation: 0.15, reverb: 0.72, mix: 0.40, bass: 0.07, treble: 0.24, width: 1.20, elevation: 0.05, distance: 1.1, density: 0.78, hrtf: 1.0,  eq_sub30: 4.0, eq_sub60: 5.5, eq_bass100: 4.5, eq_lowmid350: -2.0, eq_mid700: 0.5, eq_presence3k: 4.0, eq_bril8k: 3.0, eq_air12k: 3.5, enable_vocal_center: true },
+      lofi:         { rotation: 0.09, reverb: 0.72, mix: 0.38, bass: 0.04, treble: 0.14, width: 1.20, elevation: 0,    distance: 1.1, density: 0.70, hrtf: 0.9,  eq_sub30: 3.0, eq_sub60: 4.0, eq_bass100: 3.5, eq_lowmid350: -1.5, eq_mid700: -0.5, eq_presence3k: 1.5, eq_bril8k: 1.5, eq_air12k: 2.0, enable_vocal_center: false, intensity: 0.95 },
     };
-    const p = presets[preset];
+    const p = quickPresets[presetId] || presetData;
     if (!p) return;
-    setRotationSpeed(p.rotation);
-    setReverbRoom(p.reverb);
-    setReverbMix(p.mix);
-    setBassRotation(p.bass);
-    setTrebleRotation(p.treble);
-    setStereoWidth(p.width);
-    setElevation(p.elevation);
-    setDistance(p.distance);
-    setReverbDensity(p.density);
-    setHrtfIntensity(p.hrtf);
+    if (p.rotation     != null) setRotationSpeed(p.rotation);
+    if (p.reverb       != null) setReverbRoom(p.reverb);
+    if (p.mix          != null) setReverbMix(p.mix);
+    if (p.bass         != null) setBassRotation(p.bass);
+    if (p.treble       != null) setTrebleRotation(p.treble);
+    if (p.width        != null) setStereoWidth(p.width);
+    if (p.elevation    != null) setElevation(p.elevation);
+    if (p.distance     != null) setDistance(p.distance);
+    if (p.density      != null) setReverbDensity(p.density);
+    if (p.hrtf         != null) setHrtfIntensity(p.hrtf);
+    if (p.intensity    != null) setIntensityMultiplier(p.intensity);
+    if (p.eq_sub30     != null) setEqSub30Gain(p.eq_sub30);
+    if (p.eq_sub60     != null) setEqSub60Gain(p.eq_sub60);
+    if (p.eq_bass100   != null) setEqBass100Gain(p.eq_bass100);
+    if (p.eq_lowmid350 != null) setEqLowmid350Gain(p.eq_lowmid350);
+    if (p.eq_mid700    != null) setEqMid700Gain(p.eq_mid700);
+    if (p.eq_presence3k!= null) setEqPresence3kGain(p.eq_presence3k);
+    if (p.eq_bril8k    != null) setEqBril8kGain(p.eq_bril8k);
+    if (p.eq_air12k    != null) setEqAir12kGain(p.eq_air12k);
+    if (p.enable_vocal_center != null) setEnableVocalCenter(p.enable_vocal_center);
+    if (p.instrument_enhance  != null) setInstrumentEnhance(p.instrument_enhance);
+    if (p.vocal_safe_bass     != null) setVocalSafeBass(p.vocal_safe_bass);
+    setSelectedPreset(presetId);
+    setAutoPresetApplied(false);
+    const meta = availablePresets.find(pr => pr.id === presetId);
+    setPresetDescription(meta?.description || '');
   };
 
   const applyRecommendedSettings = (s) => {
@@ -1161,6 +1275,7 @@ const AudioConverter = () => {
     if (s.eq_uair16k_gain != null) setEqUair16kGain(s.eq_uair16k_gain);
     if (s.reverb_density != null) setReverbDensity(s.reverb_density);
     if (s.hrtf_intensity != null) setHrtfIntensity(s.hrtf_intensity);
+    if (s.intensity_multiplier != null) setIntensityMultiplier(s.intensity_multiplier);
   };
 
   const togglePlayback = () => {
@@ -1204,10 +1319,11 @@ const AudioConverter = () => {
   ];
 
   const pipelineStages = [
-    { label: 'Deep Analysis', desc: 'MFCC · key detection · crest factor · stereo correlation', threshold: 12 },
-    ...(enableStemSeparation ? [{ label: 'Stem Separation', desc: 'Demucs: vocals · drums · bass · other', threshold: 18 }] : []),
-    { label: 'Frequency Splitting', desc: spatialFormat !== 'stereo' ? `${spatialFormat === 'ambisonics_foa' ? 'Ambisonics FOA encoder' : 'Atmos 7.1.4 bed encoder'}` : '8-band HRTF separation', threshold: enableStemSeparation ? 30 : 28 },
-    { label: 'Spatial Panning', desc: 'ITD inter-ear delay · LFO volume automation', threshold: enableStemSeparation ? 52 : 48 },
+    { label: 'Deep Analysis', desc: 'MFCC · key detection · crest factor · beat positions', threshold: 12 },
+    ...(backendCaps.hrir_convolution ? [{ label: 'HRIR Pre-pass', desc: 'Binaural convolution · Woodworth ITD · pinna notches', threshold: enableStemSeparation ? 16 : 20 }] : []),
+    ...(enableStemSeparation ? [{ label: 'Stem Separation', desc: 'Demucs: vocals · drums · bass · other', threshold: 22 }] : []),
+    { label: 'Frequency Splitting', desc: spatialFormat !== 'stereo' ? `${spatialFormat === 'ambisonics_foa' ? 'Ambisonics FOA encoder' : 'Atmos 7.1.4 bed encoder'}` : '8-band HRTF separation', threshold: enableStemSeparation ? 32 : 30 },
+    { label: backendCaps.beat_locked_rotation ? 'Beat-Locked Panning' : 'Spatial Panning', desc: backendCaps.beat_locked_rotation ? 'Piecewise LFO · beat-phase tracking · ITD' : 'ITD inter-ear delay · LFO volume automation', threshold: enableStemSeparation ? 52 : 48 },
     { label: 'Pinna & Head Shadow', desc: 'Notch EQ at 8.5/10.5/13 kHz · head shadowing', threshold: enableStemSeparation ? 64 : 62 },
     { label: 'Reverb Engine', desc: 'Allpass diffusion → pre-delay → room reverb', threshold: enableStemSeparation ? 76 : 78 },
     { label: 'Mastering Chain', desc: 'Diffuse-field EQ · equal-loudness · 12-band EQ · limiter', threshold: enableStemSeparation ? 88 : 90 },
@@ -1276,8 +1392,10 @@ const AudioConverter = () => {
             </div>
             {backendStatus === 'connected' && (
               <span className="meridian-mono" style={{ fontSize: 9, color: '#7A7060', letterSpacing: '0.05em' }}>
-                {reverbEngine === 'reverberate' ? 'HD-REV' : 'AECHO'} · v7.0
+                {reverbEngine === 'reverberate' ? 'HD-REV' : 'AECHO'} · v9.0
                 {backendCaps.stem_separation && ' · STEMS'}
+                {backendCaps.hrir_convolution && ' · HRIR'}
+                {backendCaps.beat_locked_rotation && ' · BPM-LOCK'}
                 {spatialFormat === 'ambisonics_foa' && ' · AMBI'}
                 {spatialFormat === 'atmos_71_4' && ' · ATMOS'}
               </span>
@@ -1470,23 +1588,48 @@ const AudioConverter = () => {
                     </>
                   ) : (
                     <>
-                      {/* Batch upload zone */}
+                      {/* Batch upload zone — drag & drop enabled (mirrors single-file zone) */}
                       <div
                         onClick={() => batchFileInputRef.current?.click()}
+                        onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
+                        onDragLeave={() => setIsDragging(false)}
+                        onDrop={e => {
+                          e.preventDefault();
+                          setIsDragging(false);
+                          const dropped = Array.from(e.dataTransfer.files).filter(
+                            f => f.type.startsWith('audio/') || /\.(mp3|wav|m4a|flac|ogg)$/i.test(f.name)
+                          );
+                          if (dropped.length > 0) {
+                            setBatchFiles(prev => [...prev, ...dropped]);
+                          }
+                        }}
                         style={{
-                          border: '2px dashed #C8BCA8',
+                          border: `2px dashed ${isDragging ? '#C13318' : '#C8BCA8'}`,
                           borderRadius: 0,
                           padding: '48px 32px',
                           textAlign: 'center',
                           cursor: 'pointer',
-                          background: '#F9F6F0',
+                          background: isDragging ? 'rgba(193, 51, 24, 0.04)' : '#F9F6F0',
+                          transition: 'all 0.2s',
+                        }}
+                        onMouseEnter={e => {
+                          if (!isDragging) {
+                            e.currentTarget.style.borderColor = '#C13318';
+                            e.currentTarget.style.background = 'rgba(193, 51, 24, 0.02)';
+                          }
+                        }}
+                        onMouseLeave={e => {
+                          if (!isDragging) {
+                            e.currentTarget.style.borderColor = '#C8BCA8';
+                            e.currentTarget.style.background = '#F9F6F0';
+                          }
                         }}
                       >
-                        <p className="meridian-body" style={{ fontSize: 15, color: '#1C1208', margin: '0 0 8px', fontWeight: 600 }}>
-                          Select multiple audio files
+                        <p className="meridian-body" style={{ fontSize: 15, color: isDragging ? '#C13318' : '#1C1208', margin: '0 0 8px', fontWeight: 600 }}>
+                          {isDragging ? 'Drop to add files' : 'Drop files or click to select'}
                         </p>
-                        <p className="meridian-mono" style={{ fontSize: 10, color: '#7A7060', margin: 0 }}>
-                          All files processed with shared settings
+                        <p className="meridian-mono" style={{ fontSize: 10, color: '#7A7060', margin: 0, letterSpacing: '0.06em' }}>
+                          MP3 · WAV · M4A · FLAC · OGG · Multiple files supported
                         </p>
                         <input ref={batchFileInputRef} type="file" accept="audio/*" multiple
                           onChange={handleBatchFileUpload} style={{ display: 'none' }} />
@@ -1571,22 +1714,151 @@ const AudioConverter = () => {
                     </div>
                   )}
 
-                  {/* Presets */}
-                  <div style={{ marginBottom: 28 }}>
-                    <p className="meridian-section-label" style={{ marginBottom: 12 }}>
-                      Presets
-                    </p>
-                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                      {['subtle', 'classic', 'intense', 'cinematic', 'experimental'].map(preset => (
-                        <button
-                          key={preset}
-                          className="meridian-btn-secondary"
-                          onClick={() => applyPreset(preset)}
-                        >
-                          {preset}
-                        </button>
-                      ))}
+                  {/* Analysis Tags — shown after analysis completes */}
+                  {audioAnalysis && (
+                    <div style={{ marginBottom: 28 }}>
+                      <p className="meridian-section-label" style={{ marginBottom: 12 }}>
+                        Analysis Results
+                      </p>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                        {audioAnalysis.genre && audioAnalysis.genre !== 'unknown' && (
+                          <span className="meridian-analysis-tag"><span>GENRE</span><span>{audioAnalysis.genre}</span></span>
+                        )}
+                        {audioAnalysis.key && (
+                          <span className="meridian-analysis-tag"><span>KEY</span><span>{audioAnalysis.key} {audioAnalysis.mode}</span></span>
+                        )}
+                        {audioAnalysis.bpm && (
+                          <span className="meridian-analysis-tag"><span>BPM</span><span>{Math.round(audioAnalysis.bpm)}</span></span>
+                        )}
+                        {audioAnalysis.duration && (
+                          <span className="meridian-analysis-tag"><span>DUR</span><span>{Math.floor(audioAnalysis.duration / 60)}:{String(Math.round(audioAnalysis.duration % 60)).padStart(2,'0')}</span></span>
+                        )}
+                        {audioAnalysis.has_vocals != null && (
+                          <span className="meridian-analysis-tag"><span>VOCALS</span><span>{audioAnalysis.has_vocals ? 'YES' : 'NO'}</span></span>
+                        )}
+                        {audioAnalysis.is_fake_stereo != null && audioAnalysis.is_fake_stereo && (
+                          <span className="meridian-analysis-tag" style={{ borderColor: '#D4905A' }}><span>STEREO</span><span style={{ color: '#D4905A' }}>FAKE</span></span>
+                        )}
+                        {audioAnalysis.crest_factor_db != null && (
+                          <span className="meridian-analysis-tag"><span>CREST</span><span>{audioAnalysis.crest_factor_db.toFixed(1)} dB</span></span>
+                        )}
+                        {audioAnalysis.beat_positions?.length > 0 && (
+                          <span className="meridian-analysis-tag" style={{ borderColor: '#2A7A3A' }}><span>BEATS</span><span style={{ color: '#2A7A3A' }}>{audioAnalysis.beat_positions.length} LOCKED</span></span>
+                        )}
+                        {audioAnalysis.transient_density && (
+                          <span className="meridian-analysis-tag"><span>TRANSIENTS</span><span>{audioAnalysis.transient_density}</span></span>
+                        )}
+                      </div>
                     </div>
+                  )}
+
+                  {/* ═══ PRESET LIBRARY ═══ */}
+                  <div style={{ marginBottom: 28 }}>
+                    <p className="meridian-section-label" style={{ marginBottom: 12 }}>Preset Library</p>
+
+                    {/* Auto / Manual toggle */}
+                    <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                      <button
+                        className="meridian-btn-secondary"
+                        style={{ flex: 1, fontWeight: selectedPreset === 'auto' ? 700 : 400,
+                          background: selectedPreset === 'auto' ? 'rgba(27,56,88,0.08)' : undefined,
+                          border: selectedPreset === 'auto' ? '1px solid #1B3858' : undefined }}
+                        onClick={() => applyPreset('auto')}
+                      >🤖 Auto-Detect</button>
+                      <button
+                        className="meridian-btn-secondary"
+                        style={{ flex: 1, fontWeight: selectedPreset !== 'auto' ? 700 : 400,
+                          background: selectedPreset !== 'auto' ? 'rgba(27,56,88,0.08)' : undefined,
+                          border: selectedPreset !== 'auto' ? '1px solid #1B3858' : undefined }}
+                        onClick={() => applyPreset('classic')}
+                      >🎛 Manual</button>
+                    </div>
+
+                    {/* Auto mode info banner */}
+                    {selectedPreset === 'auto' && (
+                      <div style={{ padding: '10px 14px', marginBottom: 14,
+                        background: autoPresetApplied ? 'rgba(42,122,58,0.07)' : 'rgba(27,56,88,0.05)',
+                        border: `1px solid ${autoPresetApplied ? 'rgba(42,122,58,0.35)' : 'rgba(27,56,88,0.25)'}` }}>
+                        <p className="meridian-body" style={{ fontSize: 12, margin: 0, fontWeight: 500,
+                          color: autoPresetApplied ? '#2A7A3A' : '#1B3858' }}>
+                          {autoPresetApplied ? '✅ Auto-preset applied based on audio analysis'
+                            : '🔍 Upload audio to auto-detect optimal settings'}
+                        </p>
+                        {presetDescription && (
+                          <p className="meridian-mono" style={{ fontSize: 10, color: '#7A7060', margin: '5px 0 0' }}>
+                            {presetDescription}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Genre / quick-fire buttons when in manual mode */}
+                    {selectedPreset !== 'auto' && (
+                      <>
+                        {/* Quick-fire legacy presets */}
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+                          {['subtle', 'classic', 'intense', 'cinematic', 'experimental', 'youtube_8d'].map(pid => (
+                            <button key={pid} className="meridian-btn-secondary"
+                              style={{ fontWeight: selectedPreset === pid ? 700 : 400,
+                                background: selectedPreset === pid ? 'rgba(27,56,88,0.08)' : undefined }}
+                              onClick={() => applyPreset(pid)}>
+                              {pid.replace('_', ' ')}
+                            </button>
+                          ))}
+                        </div>
+
+                        {/* Genre dropdown — populated from backend if available */}
+                        <select
+                          value={selectedPreset}
+                          onChange={e => applyPreset(e.target.value)}
+                          style={{ width: '100%', padding: '9px 12px',
+                            background: '#FEFDFB', border: '1px solid #C8BCA8',
+                            fontFamily: "'Syne', sans-serif", fontSize: 13, color: '#1C1208',
+                            marginBottom: 8, cursor: 'pointer' }}>
+                          {availablePresets.length > 0 ? (
+                            Object.entries(
+                              availablePresets
+                                .filter(p => p.category !== 'auto')
+                                .reduce((acc, p) => {
+                                  if (!acc[p.category]) acc[p.category] = [];
+                                  acc[p.category].push(p);
+                                  return acc;
+                                }, {} as Record<string, any[]>)
+                            ).map(([cat, items]) => (
+                              <optgroup key={cat} label={cat.toUpperCase()}>
+                                {(items as any[]).map(p => (
+                                  <option key={p.id} value={p.id}>{p.name}</option>
+                                ))}
+                              </optgroup>
+                            ))
+                          ) : (
+                            <>
+                              <optgroup label="GENRE">
+                                <option value="pop">Pop Polish</option>
+                                <option value="electronic">Electronic Pulse</option>
+                                <option value="house">House Groove</option>
+                                <option value="rock">Rock Arena</option>
+                                <option value="hip_hop">Hip-Hop Bass</option>
+                                <option value="trap">Trap Spatial</option>
+                                <option value="rnb">R&amp;B Smooth</option>
+                                <option value="classical">Classical Hall</option>
+                                <option value="jazz">Jazz Club</option>
+                                <option value="ambient">Ambient Drift</option>
+                                <option value="lofi">Lo-Fi Chill</option>
+                                <option value="bollywood">Bollywood Grand</option>
+                                <option value="bhangra">Bhangra Energy</option>
+                                <option value="indian_classical">Indian Classical</option>
+                              </optgroup>
+                            </>
+                          )}
+                        </select>
+                        {presetDescription && (
+                          <p className="meridian-mono" style={{ fontSize: 10, color: '#7A7060', margin: 0 }}>
+                            {presetDescription}
+                          </p>
+                        )}
+                      </>
+                    )}
                   </div>
 
                   <SectionDivider label="Rotation" />
@@ -1698,6 +1970,16 @@ const AudioConverter = () => {
                     hint="Head-related transfer function strength"
                   />
 
+                  <SliderRow
+                    label="Intensity Multiplier"
+                    value={intensityMultiplier}
+                    min={0.3}
+                    max={2.0}
+                    step={0.05}
+                    onChange={setIntensityMultiplier}
+                    hint="Global pan depth scalar — scales all rotation speeds uniformly"
+                  />
+
                   <SectionDivider label="Enhancement" />
 
                   <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
@@ -1718,6 +2000,12 @@ const AudioConverter = () => {
                       onClick={() => setInstrumentEnhance(!instrumentEnhance)}
                     >
                       Instrument Enhance
+                    </button>
+                    <button
+                      className={`meridian-toggle ${enableLimiter ? 'meridian-toggle-on' : ''}`}
+                      onClick={() => setEnableLimiter(!enableLimiter)}
+                    >
+                      Limiter
                     </button>
                   </div>
 
@@ -1740,15 +2028,41 @@ const AudioConverter = () => {
                     <SliderRow label="16k Ultra-Air" value={eqUair16kGain} min={-14} max={14} step={0.5} onChange={setEqUair16kGain} unit=" dB" />
                   </div>
 
-                  <div style={{ marginTop: 32 }}>
+                  <div style={{ marginTop: 32, display: 'flex', gap: 10 }}>
                     <button
                       className="meridian-btn-primary"
-                      style={{ width: '100%', padding: '16px' }}
+                      style={{ flex: 1, padding: '16px' }}
                       onClick={process8DAudio}
                       disabled={!audioFile && !originalAudio || isProcessing || backendStatus !== 'connected'}
                     >
-                      {isProcessing ? 'Processing...' : 'Process Audio'}
+                      {isProcessing ? 'Processing…' : 'Process Audio'}
                     </button>
+                    {isProcessing && (
+                      <button
+                        onClick={cancelProcessing}
+                        style={{
+                          padding: '16px 20px',
+                          background: 'rgba(193, 51, 24, 0.08)',
+                          border: '1px solid rgba(193, 51, 24, 0.4)',
+                          color: '#C13318',
+                          fontFamily: "'Fragment Mono', monospace",
+                          fontSize: 11,
+                          letterSpacing: '0.06em',
+                          cursor: 'pointer',
+                          borderRadius: 0,
+                          transition: 'all 0.2s',
+                          flexShrink: 0,
+                        }}
+                        onMouseEnter={e => {
+                          (e.target as HTMLButtonElement).style.background = 'rgba(193,51,24,0.16)';
+                        }}
+                        onMouseLeave={e => {
+                          (e.target as HTMLButtonElement).style.background = 'rgba(193,51,24,0.08)';
+                        }}
+                      >
+                        CANCEL
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
@@ -1859,6 +2173,48 @@ const AudioConverter = () => {
 
                   <SectionDivider label="Output Settings" />
 
+                  {/* HRIR info card */}
+                  {backendCaps.hrir_convolution && (
+                    <div style={{
+                      marginBottom: 20,
+                      padding: '14px 16px',
+                      background: 'rgba(42, 122, 58, 0.05)',
+                      border: '1px solid rgba(42, 122, 58, 0.25)',
+                      borderRadius: 0,
+                      display: 'flex', alignItems: 'flex-start', gap: 10,
+                    }}>
+                      <span className="meridian-led meridian-led-green" style={{ marginTop: 2 }} />
+                      <div>
+                        <p className="meridian-body" style={{ fontSize: 12, fontWeight: 600, color: '#2A7A3A', margin: '0 0 4px' }}>
+                          HRIR Convolution Active
+                        </p>
+                        <p className="meridian-mono" style={{ fontSize: 10, color: '#7A7060', margin: 0, lineHeight: 1.5 }}>
+                          Python binaural pre-pass using Woodworth ITD + pinna notches. Drop <code style={{ color: '#1B3858' }}>kemar_hrirs.npy</code> next to backend.py to use real KEMAR measured HRIRs.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ marginBottom: 18 }}>
+                    <p className="meridian-section-label" style={{ marginBottom: 10 }}>
+                      Sample Rate
+                    </p>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      {[44100, 48000, 96000].map(sr => (
+                        <button
+                          key={sr}
+                          className={`meridian-btn-secondary ${sampleRate === sr ? 'meridian-btn-selected' : ''}`}
+                          onClick={() => setSampleRate(sr)}
+                        >
+                          {sr >= 1000 ? `${sr / 1000}k` : sr}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="meridian-body" style={{ fontSize: 10, color: '#7A7060', marginTop: 6, fontStyle: 'italic' }}>
+                      96k recommended with HRIR engine — more samples = smoother convolution
+                    </p>
+                  </div>
+
                   <div style={{ marginBottom: 18 }}>
                     <p className="meridian-section-label" style={{ marginBottom: 10 }}>
                       Format
@@ -1968,6 +2324,45 @@ const AudioConverter = () => {
                             </div>
                           </div>
 
+                          <SectionDivider label="Stem Engine Options" />
+
+                          <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
+                            <button
+                              className={`meridian-toggle ${stemAutoRoute ? 'meridian-toggle-on' : ''}`}
+                              onClick={() => setStemAutoRoute(!stemAutoRoute)}
+                              title="Let InstrumentRouter assign psychoacoustic params per stem automatically"
+                            >
+                              Auto Route
+                            </button>
+                            <button
+                              className={`meridian-toggle ${enableGainStaging ? 'meridian-toggle-on' : ''}`}
+                              onClick={() => setEnableGainStaging(!enableGainStaging)}
+                              title="Normalise each stem to target LUFS before spatial processing"
+                            >
+                              Gain Staging
+                            </button>
+                            <button
+                              className={`meridian-toggle ${enableMultibandMaster ? 'meridian-toggle-on' : ''}`}
+                              onClick={() => setEnableMultibandMaster(!enableMultibandMaster)}
+                              title="Apply multiband compressor on the master stem mix bus"
+                            >
+                              Multiband Master
+                            </button>
+                          </div>
+
+                          {enableGainStaging && (
+                            <SliderRow
+                              label="Target LUFS"
+                              value={stemTargetLufs}
+                              min={-32}
+                              max={-14}
+                              step={0.5}
+                              onChange={setStemTargetLufs}
+                              unit=" LUFS"
+                              hint="Loudness target for per-stem gain normalisation (EBU R128: −23 LUFS)"
+                            />
+                          )}
+
                           <div style={{ marginBottom: 24 }}>
                             <p className="meridian-section-label" style={{ marginBottom: 12 }}>
                               Stem Preset
@@ -2074,15 +2469,15 @@ const AudioConverter = () => {
                                     emoji: '🎺', label: 'Guitar',
                                     rot: stemGuitarRotation ?? rotationSpeed, setRot: setStemGuitarRotation, rotMax: 0.6,
                                     wid: stemGuitarWidth ?? stereoWidth, setWid: setStemGuitarWidth,
-                                    elev: null, setElev: null,
-                                    rev: null, setRev: null,
+                                    elev: stemGuitarElevation ?? elevation, setElev: setStemGuitarElevation,
+                                    rev: stemGuitarReverb ?? reverbMix, setRev: setStemGuitarReverb,
                                   },
                                   {
                                     emoji: '🎵', label: 'Piano',
                                     rot: stemPianoRotation ?? rotationSpeed, setRot: setStemPianoRotation, rotMax: 0.6,
                                     wid: stemPianoWidth ?? stereoWidth, setWid: setStemPianoWidth,
-                                    elev: null, setElev: null,
-                                    rev: null, setRev: null,
+                                    elev: stemPianoElevation ?? elevation, setElev: setStemPianoElevation,
+                                    rev: stemPianoReverb ?? reverbMix, setRev: setStemPianoReverb,
                                   },
                                 ] : []),
                               ].map(stem => (
